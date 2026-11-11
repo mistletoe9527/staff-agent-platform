@@ -33,7 +33,8 @@ export function buildStats(db: Db, input: { days: number; onlineWindowSec: numbe
     output_tokens: number | null;
   };
 
-  const agentCounts = db.prepare('SELECT COUNT(*) AS c FROM agents').get() as { c: number };
+  // 只数主 Agent：管理后台的「数字员工」口径，子工作区不算人头
+  const agentCounts = db.prepare('SELECT COUNT(*) AS c FROM agents WHERE is_primary = 1').get() as { c: number };
   const onlineCounts = db
     .prepare(
       `SELECT COUNT(DISTINCT agent_id) AS c FROM devices
@@ -65,9 +66,9 @@ export function buildStats(db: Db, input: { days: number; onlineWindowSec: numbe
 
   const topAgents = db
     .prepare(
-      `SELECT r.agent_id AS agent_id, a.name AS name, COUNT(*) AS runs,
+      `SELECT r.agent_id AS agent_id, COALESCE(a.name, '（已删除的 Agent）') AS name, COUNT(*) AS runs,
               SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded
-       FROM runs r JOIN agents a ON a.id = r.agent_id
+       FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
        WHERE r.created_at >= ?
        GROUP BY r.agent_id ORDER BY runs DESC LIMIT 10`,
     )
@@ -84,7 +85,7 @@ export function buildStats(db: Db, input: { days: number; onlineWindowSec: numbe
     .all(since) as unknown as Array<{ name: string; count: number; avg_duration: number | null; errors: number | null }>;
 
   const runtimeSplit = db
-    .prepare('SELECT runtime, COUNT(*) AS agents FROM agents GROUP BY runtime')
+    .prepare('SELECT runtime, COUNT(*) AS agents FROM agents WHERE is_primary = 1 GROUP BY runtime')
     .all() as unknown as unknown as Array<{ runtime: AgentRuntime; agents: number }>;
 
   const runs = Number(totalsRow.runs);

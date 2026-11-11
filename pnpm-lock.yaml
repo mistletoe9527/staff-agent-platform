@@ -79,9 +79,6 @@ importers:
 
   packages/bridge:
     dependencies:
-      '@staff-agent/shared':
-        specifier: workspace:*
-        version: link:../shared
       commander:
         specifier: ^13.0.0
         version: 13.1.0
@@ -92,6 +89,9 @@ importers:
         specifier: ^3.24.1
         version: 3.25.76
     devDependencies:
+      '@staff-agent/shared':
+        specifier: workspace:*
+        version: link:../shared
       '@types/node':
         specifier: ^22.10.2
         version: 22.20.5

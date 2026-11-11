@@ -1,10 +1,11 @@
 import type { EnrollPollResponse } from '@staff-agent/shared';
 import type { Config } from '../config.js';
 import type { Db } from '../db/client.js';
-import { createAgent, findAgentById, findAgentByOpenId } from '../domain/agents.js';
+import { createAgent, findAgentById, findAgentByOpenId, updateAgent } from '../domain/agents.js';
 import { bindDeviceToAgent, findDeviceById, revokeOtherDevices, setDeviceToken, type Device } from '../domain/devices.js';
 import { consumeEnrollCode, findEnrollRecord, setPendingToken, takePendingToken, type EnrollRecord } from '../domain/enroll.js';
 import type { FeishuPort, IncomingMessage } from '../feishu/client.js';
+import { syncAgentProfileSafely } from './identity-service.js';
 import { newToken } from '../util/ids.js';
 import { sha256 } from '../util/hash.js';
 import { errorText, type Logger } from '../util/logger.js';
@@ -47,17 +48,17 @@ export class EnrollService {
   private check(code: string, openId: string): { ok: true; context: BindContext } | { ok: false; message: string } {
     const record = findEnrollRecord(this.db, code, this.config.sessionSecret);
     if (!record) {
-      return { ok: false, message: '绑定码无效。请在电脑上重新运行 staff-agent login 生成新的绑定码。' };
+      return { ok: false, message: '绑定码无效。请在电脑上重新运行 sa login 生成新的绑定码。' };
     }
     if (record.consumedAt) {
-      return { ok: false, message: '这个绑定码已经用过了。如果电脑端没有拿到凭据，请重新运行 staff-agent login。' };
+      return { ok: false, message: '这个绑定码已经用过了。如果电脑端没有拿到凭据，请重新运行 sa login。' };
     }
     if (new Date(record.expiresAt).getTime() < Date.now()) {
-      return { ok: false, message: '绑定码已过期（有效期 5 分钟）。请重新运行 staff-agent login。' };
+      return { ok: false, message: '绑定码已过期（有效期 5 分钟）。请重新运行 sa login。' };
     }
     const device = findDeviceById(this.db, record.deviceId);
     if (!device || device.status !== 'active') {
-      return { ok: false, message: '设备记录已失效。请重新运行 staff-agent login。' };
+      return { ok: false, message: '设备记录已失效。请重新运行 sa login。' };
     }
     const existing = findAgentByOpenId(this.db, openId);
     if (existing && existing.status === 'disabled') {
@@ -79,14 +80,18 @@ export class EnrollService {
       agentId = existing.id;
       agentName = existing.name;
       bindDeviceToAgent(this.db, device.id, existing.id);
+      // 迁移后的老数据 device_id 为空，这里顺手补齐
+      updateAgent(this.db, existing.id, { deviceId: device.id });
     } else {
-      // 姓名在调用方补齐（飞书通讯录需要异步查询），这里只做落库
+      // 姓名在调用方补齐（飞书通讯录需要异步查询），这里只做落库。
+      // 主 Agent 由绑定流程创建，工作目录与说明稍后由客户端上报。
       const name = `agent-${openId.slice(-4)}`;
       const agent = createAgent(this.db, {
         feishuOpenId: openId,
         feishuName: null,
         name,
         runtime: device.runtime,
+        deviceId: device.id,
       });
       agentId = agent.id;
       agentName = agent.name;
@@ -103,23 +108,17 @@ export class EnrollService {
   }
 
   /**
-   * 绑定并补齐飞书姓名（仅首次创建 Agent 时查询，避免每次绑定都调通讯录）。
+   * 绑定后补齐飞书姓名与头像。
+   * 已绑定过的人也重新拉一次：管理员刚开通通讯录权限时，重登就能把名字头像补上。
    */
-  private async finalizeWithName(context: BindContext, openId: string): Promise<{ agentId: string; agentName: string }> {
-    const existing = findAgentByOpenId(this.db, openId);
+  private async finalizeWithProfile(
+    context: BindContext,
+    openId: string,
+  ): Promise<{ agentId: string; agentName: string }> {
     const result = this.finalize(context, openId);
-    if (existing) return result;
-    const feishuName = await this.client.getUserName(openId);
-    if (feishuName) {
-      this.db.prepare('UPDATE agents SET feishu_name = ?, name = ?, updated_at = ? WHERE id = ?').run(
-        feishuName,
-        feishuName,
-        new Date().toISOString(),
-        result.agentId,
-      );
-      result.agentName = feishuName;
-    }
-    return result;
+    await syncAgentProfileSafely(this.db, this.client, result.agentId, this.logger);
+    const agent = findAgentById(this.db, result.agentId);
+    return { agentId: result.agentId, agentName: agent?.name ?? result.agentName };
   }
 
   /**
@@ -127,9 +126,17 @@ export class EnrollService {
    * @returns false 表示不是绑定码，交给任务派发流程
    */
   async handleCodeMessage(message: IncomingMessage): Promise<boolean> {
-    const code = message.text.trim();
+    if (message.messageType !== 'text') return false;
+    // 飞书把 @ 渲染成 @_user_1 这类占位符，去掉后再判断，否则「@机器人 123456」识别不出来
+    const code = message.text.replace(/@_user_\d+/g, ' ').replace(/@_all/g, ' ').trim();
     if (!/^\d{6}$/.test(code)) return false;
+    // 群聊里必须 @机器人，避免群里其他人随手发的 6 位数字把码绑走
+    if (message.chatType === 'group' && !message.mentionedBot) return false;
 
+    this.logger.info(
+      { messageId: message.messageId, chatType: message.chatType },
+      '收到绑定码消息，开始绑定',
+    );
     const outcome = await this.bindByCode(code, message.senderOpenId);
     await this.client.replyText(message.messageId, outcome.message);
     return true;
@@ -144,7 +151,7 @@ export class EnrollService {
     try {
       const checked = this.check(code, openId);
       if (!checked.ok) return { ok: false, message: checked.message };
-      const result = await this.finalizeWithName(checked.context, openId);
+      const result = await this.finalizeWithProfile(checked.context, openId);
       return {
         ok: true,
         agentName: result.agentName,

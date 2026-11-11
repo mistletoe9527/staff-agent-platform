@@ -1,7 +1,7 @@
 import type { Config } from '../config.js';
 import type { Db } from '../db/client.js';
 import { findAgentByOpenId } from '../domain/agents.js';
-import { findActiveDeviceByAgent } from '../domain/devices.js';
+import { findActiveDeviceByAgent, findDeviceById } from '../domain/devices.js';
 import { upsertConversation } from '../domain/conversations.js';
 import { countQueuedRuns, createRun, hasRunningRun } from '../domain/runs.js';
 import type { FeishuPort, IncomingMessage } from '../feishu/client.js';
@@ -15,6 +15,8 @@ import { errorText, type Logger } from '../util/logger.js';
  * - 私聊：消息发给机器人主人自己的 Agent
  * - 群聊：必须 @机器人 + @某个人，任务投给被 @ 的那个人的 Agent
  * - 只 @机器人 不 @人：提示补充，不猜默认执行者
+ * - 工作区（子 Agent）是员工本机的概念：平台原样下发正文，
+ *   `#名字` / `#列表` 的解析与目录切换都由本机网关完成
  */
 export class DispatchService {
   constructor(
@@ -62,12 +64,13 @@ export class DispatchService {
     }
 
     const agent = findAgentByOpenId(this.db, targetOpenId);
+
     if (!agent) {
       await this.client.replyText(
         message.messageId,
         isGroup
-          ? '这个人还没有绑定 Agent。请对方在自己的电脑上运行 staff-agent login 完成绑定。'
-          : '你还没有绑定 Agent。请在电脑上运行 staff-agent login 完成绑定。',
+          ? '这个人还没有绑定 Agent。请对方在自己的电脑上运行 sa login 完成绑定。'
+          : '你还没有绑定 Agent。请在电脑上运行 sa login 完成绑定。',
       );
       return;
     }
@@ -76,8 +79,8 @@ export class DispatchService {
       return;
     }
 
-    const device = findActiveDeviceByAgent(this.db, agent.id);
-    if (!device) {
+    const device = agent.deviceId ? findDeviceById(this.db, agent.deviceId) : findActiveDeviceByAgent(this.db, agent.id);
+    if (!device || device.status !== 'active') {
       await this.client.replyText(message.messageId, '该 Agent 还没有绑定设备，无法执行任务。');
       return;
     }
@@ -93,6 +96,8 @@ export class DispatchService {
       deviceId: device.id,
       conversationId: conversation.id,
       prompt,
+      // 工作区由本机网关决定，平台不指定目录
+      cwd: null,
       feishuChatId: message.chatId,
       feishuMessageId: message.messageId,
       createdByOpenId: message.senderOpenId,
@@ -118,7 +123,10 @@ export class DispatchService {
         ? `已排队（任务 ${run.id}，前面还有 ${Math.max(queued - 1, 0)} 个）。执行完会在这里回复结果。`
         : `已收到（任务 ${run.id}），${agent.name} 开始执行，完成后会在这里回复。`,
     );
-    this.logger.info({ runId: run.id, agentId: agent.id }, '任务已入队');
+    this.logger.info(
+      { runId: run.id, agentId: agent.id, agentName: agent.name },
+      '任务已入队',
+    );
   }
 
   /** 包一层错误处理，任何派发异常都要回一条可读提示。 */

@@ -9,6 +9,8 @@ export interface RunRow {
   device_id: string;
   conversation_id: string;
   prompt: string;
+  /** 本次任务实际执行的工作目录（主工作区或某个子工作区） */
+  cwd: string | null;
   status: RunStatus;
   attempt: number;
   lease_id: string | null;
@@ -34,6 +36,8 @@ export interface Run {
   deviceId: string;
   conversationId: string;
   prompt: string;
+  /** 本次任务实际执行的工作目录（主工作区或某个子工作区） */
+  cwd: string | null;
   status: RunStatus;
   attempt: number;
   leaseId: string | null;
@@ -60,6 +64,7 @@ export function toRun(row: RunRow): Run {
     deviceId: row.device_id,
     conversationId: row.conversation_id,
     prompt: row.prompt,
+    cwd: row.cwd,
     status: row.status,
     attempt: row.attempt,
     leaseId: row.lease_id,
@@ -87,6 +92,8 @@ export function createRun(
     deviceId: string;
     conversationId: string;
     prompt: string;
+    /** 指定在哪个工作区执行；为空时由 Agent 的主工作目录兜底 */
+    cwd?: string | null;
     feishuChatId: string;
     feishuMessageId: string | null;
     createdByOpenId: string | null;
@@ -96,16 +103,17 @@ export function createRun(
   const id = newId('run');
   const now = nowIso();
   db.prepare(
-    `INSERT INTO runs (id, agent_id, device_id, conversation_id, prompt, status, attempt, lease_id, lease_expires_at,
+    `INSERT INTO runs (id, agent_id, device_id, conversation_id, prompt, cwd, status, attempt, lease_id, lease_expires_at,
        result, error, duration_ms, input_tokens, output_tokens, session_ref, feishu_chat_id, feishu_message_id,
        created_by_open_id, created_at, started_at, ended_at)
-     VALUES (?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?, ?, NULL, NULL)`,
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?, ?, NULL, NULL)`,
   ).run(
     id,
     input.agentId,
     input.deviceId,
     input.conversationId,
     input.prompt,
+    input.cwd ?? null,
     input.sessionRef,
     input.feishuChatId,
     input.feishuMessageId,
@@ -118,6 +126,7 @@ export function createRun(
     deviceId: input.deviceId,
     conversationId: input.conversationId,
     prompt: input.prompt,
+    cwd: input.cwd ?? null,
     status: 'queued',
     attempt: 0,
     leaseId: null,
@@ -156,20 +165,23 @@ export function countQueuedRuns(db: Db, agentId: string): number {
 /**
  * 认领下一个任务。
  * 单实例 + 同步 SQLite，两步读写天然原子：先查候选，再带 status 条件更新。
- * 同一 Agent 串行执行，避免两个任务抢同一段会话上下文。
+ * 同一 Agent 串行执行，避免两个任务抢同一段会话上下文；
+ * 但一台设备上可以有多个 Agent，所以按 Agent 集合认领，不同 Agent 之间互不阻塞。
  */
 export function claimNextRun(
   db: Db,
-  input: { agentId: string; deviceId: string; leaseMs: number },
+  input: { agentIds: string[]; deviceId: string; leaseMs: number },
 ): Run | null {
+  if (input.agentIds.length === 0) return null;
+  const placeholders = input.agentIds.map(() => '?').join(', ');
   const candidate = db
     .prepare(
-      `SELECT * FROM runs
-       WHERE agent_id = ? AND status = 'queued'
-         AND NOT EXISTS (SELECT 1 FROM runs r2 WHERE r2.agent_id = ? AND r2.status = 'running')
-       ORDER BY created_at ASC LIMIT 1`,
+      `SELECT * FROM runs r
+       WHERE r.agent_id IN (${placeholders}) AND r.status = 'queued'
+         AND NOT EXISTS (SELECT 1 FROM runs r2 WHERE r2.agent_id = r.agent_id AND r2.status = 'running')
+       ORDER BY r.created_at ASC LIMIT 1`,
     )
-    .get(input.agentId, input.agentId) as unknown as RunRow | undefined;
+    .get(...input.agentIds) as unknown as RunRow | undefined;
   if (!candidate) return null;
   const leaseId = newToken(16);
   const now = nowIso();
@@ -217,6 +229,8 @@ export function finishRun(
     inputTokens?: number | null;
     outputTokens?: number | null;
     sessionRef?: string | null;
+    /** 实际执行目录：工作区路由在本机决定，回传后写入任务便于追溯 */
+    cwd?: string | null;
   },
 ): RunRow | null {
   const now = nowIso();
@@ -226,7 +240,8 @@ export function finishRun(
   if (!current) return null;
   db.prepare(
     `UPDATE runs SET status = ?, result = ?, error = ?, duration_ms = ?, input_tokens = ?, output_tokens = ?,
-       session_ref = COALESCE(?, session_ref), ended_at = ?, lease_id = NULL, lease_expires_at = NULL
+       session_ref = COALESCE(?, session_ref), cwd = COALESCE(?, cwd), ended_at = ?,
+       lease_id = NULL, lease_expires_at = NULL
      WHERE id = ?`,
   ).run(
     input.status,
@@ -236,6 +251,7 @@ export function finishRun(
     input.inputTokens ?? 0,
     input.outputTokens ?? 0,
     input.sessionRef ?? null,
+    input.cwd ?? null,
     now,
     input.runId,
   );
@@ -307,7 +323,8 @@ function decodeCursor(cursor: string): { createdAt: string; id: string } | null 
 }
 
 /**
- * 分页查询任务，JOIN agents 一次取回 Agent 名称，避免逐行查询。
+ * 分页查询任务，LEFT JOIN agents 一次取回 Agent 名称，避免逐行查询。
+ * 用 LEFT JOIN 是因为 Agent 可以被删除，但历史任务与 trace 必须留得下来（追责用）。
  */
 export function listRuns(
   db: Db,
@@ -341,7 +358,8 @@ export function listRuns(
   const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
   const rows = db
     .prepare(
-      `SELECT r.*, a.name AS agent_name FROM runs r JOIN agents a ON a.id = r.agent_id
+      `SELECT r.*, COALESCE(a.name, '（已删除的 Agent）') AS agent_name
+       FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
        ${clause}
        ORDER BY r.created_at DESC, r.id DESC LIMIT ?`,
     )

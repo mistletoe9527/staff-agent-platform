@@ -6,6 +6,15 @@ export function Spinner(): React.JSX.Element {
   return <div className="spinner" role="status" aria-label="加载中" />;
 }
 
+/**
+ * 飞书头像。没有头像（未同步 / 无通讯录权限）时用姓名首字占位，避免列表逐行跳动。
+ */
+export function Avatar({ name, url }: { name: string; url: string | null }): React.JSX.Element {
+  const initial = name.trim().slice(0, 1).toUpperCase() || '?';
+  if (!url) return <span className="avatar avatar-fallback">{initial}</span>;
+  return <img className="avatar" src={url} alt={name} loading="lazy" referrerPolicy="no-referrer" />;
+}
+
 /** 空状态。 */
 export function EmptyState({ text }: { text: string }): React.JSX.Element {
   return <div className="empty">{text}</div>;

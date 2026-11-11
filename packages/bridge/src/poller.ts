@@ -1,6 +1,6 @@
 import type { PollResponse } from '@staff-agent/shared';
 import { PlatformApi, PlatformError, isRunAssignment } from './api.js';
-import type { BridgeConfig } from './config.js';
+import type { ConfigHandle } from './config.js';
 import { Runner } from './runner.js';
 import { log, errorText } from './log.js';
 import { createAdapter } from './runtimes/index.js';
@@ -22,26 +22,28 @@ export class Poller {
 
   constructor(
     private readonly api: PlatformApi,
-    private readonly config: BridgeConfig,
+    private readonly config: ConfigHandle,
   ) {}
 
   /** 启动主循环，直到 signal 中断。 */
   async run(signal: AbortSignal): Promise<void> {
-    const adapter = createAdapter(this.config.runtime);
+    const initial = this.config.get();
+    const adapter = createAdapter(initial.runtime);
     const check = await adapter.check();
     if (check.ok) {
       this.runtimeVersion = check.version;
-      log('info', '运行时可用', { runtime: this.config.runtime, version: check.version });
+      log('info', '运行时可用', { runtime: initial.runtime, version: check.version });
     } else {
       log('error', '本机未找到可用的运行时，任务会失败', {
-        runtime: this.config.runtime,
+        runtime: initial.runtime,
         detail: check.detail,
       });
     }
     log('info', '网关已连接平台，开始接收任务', {
-      platform: this.config.platformUrl,
-      agent: this.config.agentName,
-      cwd: this.config.cwd,
+      platform: initial.platformUrl,
+      agent: initial.agentName,
+      cwd: initial.cwd,
+      workspaces: initial.workspaces.length,
       bridge: BRIDGE_VERSION,
     });
 
@@ -50,12 +52,17 @@ export class Poller {
 
     while (!signal.aborted && !this.stopping) {
       try {
+        // 每次轮询取最新配置：工作区在另一个进程里增删，重启不应该是生效前提
+        const config = this.config.get();
         const response: PollResponse = await this.api.poll(
           {
             state: this.active > 0 ? 'busy' : 'idle',
             activeRuns: this.active,
             runtimeVersion: this.runtimeVersion,
             bridgeVersion: BRIDGE_VERSION,
+            // 主工作区只报上去展示；子工作区（#名字）完全留在本机
+            cwd: config.cwd,
+            description: config.description ?? null,
           },
           signal,
         );
@@ -78,7 +85,7 @@ export class Poller {
       } catch (error) {
         if (signal.aborted || this.stopping) break;
         if (error instanceof PlatformError && error.status === 401) {
-          log('error', '设备令牌已失效，请重新运行 staff-agent login', { reason: error.message });
+          log('error', '设备令牌已失效，请重新运行 sa login', { reason: error.message });
           process.exitCode = 2;
           break;
         }

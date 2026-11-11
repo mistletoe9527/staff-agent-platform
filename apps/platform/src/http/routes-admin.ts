@@ -4,7 +4,9 @@ import { z } from 'zod';
 import type { AgentStatus, RunStatus } from '@staff-agent/shared';
 import type { Config } from '../config.js';
 import type { Db } from '../db/client.js';
-import { findAgentById, updateAgent } from '../domain/agents.js';
+import { deleteAgentAccount, findAgentById, updateAgent } from '../domain/agents.js';
+import type { FeishuPort } from '../feishu/client.js';
+import { syncAgentProfile } from '../services/identity-service.js';
 import { audit } from '../domain/audit.js';
 import { revokeDevicesByAgent } from '../domain/devices.js';
 import { findRunById, listRuns } from '../domain/runs.js';
@@ -23,6 +25,8 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 export interface AdminRouteDeps {
   db: Db;
   config: Config;
+  /** 后台需要拉飞书姓名/头像，关闭飞书时是空实现 */
+  feishu: FeishuPort;
   logger: Logger;
 }
 
@@ -33,6 +37,8 @@ const LoginSchema = z.object({ password: z.string().min(1).max(256) });
 const AgentPatchSchema = z.object({
   name: z.string().min(1).max(64).optional(),
   status: z.enum(['active', 'disabled']).optional(),
+  /** 工作区说明：管理员也可以在这里补写，客户端下次上报会覆盖 */
+  description: z.string().max(500).nullable().optional(),
 });
 
 /** 生成会话令牌：过期时间 + HMAC 签名。无状态，重启不掉线。 */
@@ -57,7 +63,7 @@ function verifySession(token: string | undefined, config: Config): boolean {
 
 /** 管理后台路由。全部走 Cookie 会话，不做多级权限（私有化单租户场景）。 */
 export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps): void {
-  const { db, config, logger } = deps;
+  const { db, config, feishu, logger } = deps;
 
   /** 统一鉴权。 */
   const requireAdmin = (request: FastifyRequest, reply: FastifyReply): boolean => {
@@ -105,6 +111,35 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
     return { items };
   });
 
+  // 重新拉一次飞书姓名与头像（开了通讯录权限后不用员工重登）
+  app.post('/api/admin/agents/:id/sync-profile', async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
+    const params = request.params as { id: string };
+    const agent = findAgentById(db, params.id);
+    if (!agent) return reply.code(404).send({ ok: false, error: 'Agent 不存在' });
+    const result = await syncAgentProfile(db, feishu, agent.id, logger);
+    if (!result) return reply.code(404).send({ ok: false, error: 'Agent 不存在' });
+    const { agent: updated, error } = result;
+    audit(db, { actor: `admin@${request.ip}`, action: 'agent.sync_profile', target: agent.id, detail: null });
+    if (!updated.feishuName && !updated.feishuAvatarUrl) {
+      // 把飞书的错误码与处理建议原样带给后台，不再给一句无法排查的笼统提示
+      return reply.code(502).send({
+        ok: false,
+        error: error
+          ? `同步飞书身份失败：${error.hint}`
+          : '没有拿到飞书身份：飞书返回的数据里没有姓名/头像，检查该员工是否已完善通讯录资料',
+        feishuCode: error?.code ?? null,
+        feishuMsg: error?.msg ?? null,
+      });
+    }
+    return {
+      ok: true,
+      feishuName: updated.feishuName,
+      feishuAvatarUrl: updated.feishuAvatarUrl,
+      name: updated.name,
+    };
+  });
+
   // 修改 Agent 名称 / 启用禁用
   app.patch('/api/admin/agents/:id', async (request, reply) => {
     if (!requireAdmin(request, reply)) return;
@@ -134,6 +169,32 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
     return { ok: true, revoked };
   });
 
+  // 删除数字员工（不可逆）：撤销设备、清会话与绑定码；历史任务与 trace 保留
+  app.delete('/api/admin/agents/:id', async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
+    const params = request.params as { id: string };
+    const query = request.query as { confirm?: string };
+    const agent = findAgentById(db, params.id);
+    if (!agent) return reply.code(404).send({ ok: false, error: 'Agent 不存在' });
+    // 二次确认：必须把名字原样带上，避免误点
+    if ((query.confirm ?? '').trim().toLowerCase() !== agent.name.trim().toLowerCase()) {
+      return reply.code(400).send({ ok: false, error: `确认参数不匹配：请带上 ?confirm=${encodeURIComponent(agent.name)}` });
+    }
+    const result = deleteAgentAccount(db, agent.id);
+    audit(db, {
+      actor: `admin@${request.ip}`,
+      action: 'agent.delete',
+      target: agent.id,
+      detail: JSON.stringify({
+        name: agent.name,
+        feishuOpenId: agent.feishuOpenId,
+        ...result,
+      }),
+    });
+    logger.info({ agentId: agent.id, name: agent.name, ...result }, '数字员工已删除');
+    return { ok: true, ...result };
+  });
+
   // 任务列表（按月窗口 + 游标分页）
   app.get('/api/admin/runs', async (request, reply) => {
     if (!requireAdmin(request, reply)) return;
@@ -161,6 +222,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
         agentName: row.agent_name,
         status: row.status,
         promptPreview: row.prompt.slice(0, 120),
+        cwd: row.cwd,
         createdAt: row.created_at,
         endedAt: row.ended_at,
         durationMs: row.duration_ms,
@@ -187,6 +249,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
       status: run.status,
       promptPreview: run.prompt.slice(0, 120),
       prompt: run.prompt,
+      cwd: run.cwd,
       result: run.result,
       createdAt: run.createdAt,
       endedAt: run.endedAt,

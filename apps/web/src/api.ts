@@ -8,18 +8,25 @@ export class UnauthorizedError extends Error {
   }
 }
 
-/** 统一请求封装：JSON + Cookie + 错误信息。 */
+/** 统一请求封装：JSON + Cookie + 错误信息。无 body 的请求不要声明 JSON，否则 Fastify 拒收空 body。 */
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const hasBody = init.body !== undefined && init.body !== null;
   const response = await fetch(path, {
     credentials: 'include',
-    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
     ...init,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(init.headers ?? {}),
+    },
   });
   if (response.status === 401) throw new UnauthorizedError();
   const text = await response.text();
   const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
   if (!response.ok) {
-    throw new Error(typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`);
+    const parts = [payload.error, payload.message]
+      .filter((part): part is string => typeof part === 'string' && part.trim() !== '')
+      .filter((part, index, all) => index === 0 || part !== all[0]);
+    throw new Error(parts.length > 0 ? parts.join(': ') : `HTTP ${response.status}`);
   }
   return payload as T;
 }
@@ -37,10 +44,20 @@ export const api = {
     const suffix = params.toString() ? `?${params.toString()}` : '';
     return request<{ items: AgentView[] }>(`/api/admin/agents${suffix}`);
   },
-  updateAgent: (id: string, patch: { name?: string; status?: AgentStatus }) =>
+  updateAgent: (id: string, patch: { name?: string; status?: AgentStatus; description?: string | null }) =>
     request<{ ok: true }>(`/api/admin/agents/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   kick: (id: string) =>
     request<{ ok: true; revoked: number }>(`/api/admin/agents/${id}/kick`, { method: 'POST' }),
+  deleteAgent: (id: string, name: string) =>
+    request<{ ok: true; devices: number; conversations: number; enrollCodes: number }>(
+      `/api/admin/agents/${id}?confirm=${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    ),
+  syncProfile: (id: string) =>
+    request<{ ok: true; name: string; feishuName: string | null; feishuAvatarUrl: string | null }>(
+      `/api/admin/agents/${id}/sync-profile`,
+      { method: 'POST' },
+    ),
   runs: (query: { agentId?: string; status?: RunStatus; cursor?: string; days?: number; limit?: number }) => {
     const params = new URLSearchParams();
     if (query.agentId) params.set('agentId', query.agentId);

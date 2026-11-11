@@ -3,6 +3,7 @@ import type { AgentStatus, AgentView } from '@staff-agent/shared';
 import { api, formatTime } from '../api.js';
 import {
   AgentStatusBadge,
+  Avatar,
   Card,
   EmptyState,
   ErrorBanner,
@@ -13,7 +14,8 @@ import {
 
 /**
  * Agent 列表页。
- * 管理员在这里看谁绑了、哪台机器、在不在线，并做启用/禁用、改名、强制下线。
+ * 管理员在这里看「数字员工」：谁绑了、飞书是谁、哪台机器、在不在线，并做启用/禁用、改名、强制下线。
+ * 子 Agent（工作区）是员工本机的事，不进这张表。
  */
 export function AgentsPage({
   onUnauthorized,
@@ -68,11 +70,67 @@ export function AgentsPage({
     }
   };
 
+  const editDescription = async (agent: AgentView): Promise<void> => {
+    const description = window.prompt(
+      `「${agent.name}」的工作区描述（留空表示清除，客户端会按目录重新生成）`,
+      agent.description ?? '',
+    );
+    if (description === null) return;
+    setBusyId(agent.id);
+    try {
+      await api.updateAgent(agent.id, { description: description.trim() || null });
+      load();
+    } catch (mutationError) {
+      setError(handleAuthError(mutationError, onUnauthorized));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const kick = async (agent: AgentView): Promise<void> => {
     if (!window.confirm(`确定让「${agent.name}」的机器下线吗？下线后对方需要重新登录。`)) return;
     setBusyId(agent.id);
     try {
       await api.kick(agent.id);
+      load();
+    } catch (mutationError) {
+      setError(handleAuthError(mutationError, onUnauthorized));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const remove = async (agent: AgentView): Promise<void> => {
+    const answer = window.prompt(
+      `删除数字员工「${agent.name}」是不可逆的：\n` +
+        '· 设备令牌立即失效，对方需要重新 sa login\n' +
+        '· 会话上下文清空，重新绑定后开启新会话\n' +
+        '· 历史任务与 trace 保留（显示为「已删除的 Agent」）\n\n' +
+        `确认请输入该 Agent 的名字：`,
+      '',
+    );
+    if (answer === null) return;
+    if (answer.trim() !== agent.name.trim()) {
+      setError('输入的名字不匹配，已取消删除');
+      return;
+    }
+    setBusyId(agent.id);
+    setError(null);
+    try {
+      await api.deleteAgent(agent.id, agent.name);
+      load();
+    } catch (mutationError) {
+      setError(handleAuthError(mutationError, onUnauthorized));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const syncProfile = async (agent: AgentView): Promise<void> => {
+    setBusyId(agent.id);
+    setError(null);
+    try {
+      await api.syncProfile(agent.id);
       load();
     } catch (mutationError) {
       setError(handleAuthError(mutationError, onUnauthorized));
@@ -90,7 +148,7 @@ export function AgentsPage({
         </div>
         <div className="filters">
           <input
-            placeholder="搜索名称或 open_id"
+            placeholder="搜索名称、描述或工作目录"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -108,13 +166,14 @@ export function AgentsPage({
         {items === null ? (
           <Spinner />
         ) : items.length === 0 ? (
-          <EmptyState text="还没有 Agent。让员工在本机运行 staff-agent login 完成绑定。" />
+          <EmptyState text="还没有 Agent。让员工在本机运行 sa login 完成绑定。" />
         ) : (
           <table className="table">
             <thead>
               <tr>
-                <th>Agent</th>
+                <th>数字员工</th>
                 <th>飞书身份</th>
+                <th>主工作区</th>
                 <th>运行时</th>
                 <th>机器</th>
                 <th>最近心跳</th>
@@ -128,12 +187,19 @@ export function AgentsPage({
                   <td>
                     <div className="cell-main">
                       <OnlineDot online={agent.device?.online ?? false} />
-                      <span>{agent.name}</span>
+                      <Avatar name={agent.feishuName ?? agent.name} url={agent.feishuAvatarUrl} />
+                      <span>{agent.feishuName ?? agent.name}</span>
                       <AgentStatusBadge status={agent.status} />
                     </div>
-                    <div className="cell-sub mono">{agent.id}</div>
+                    <div className="cell-sub mono">
+                      {agent.name} · {agent.id}
+                    </div>
                   </td>
                   <td className="mono small">{agent.feishuOpenId}</td>
+                  <td>
+                    <div className="mono small">{agent.cwd ?? <span className="muted">未上报目录</span>}</div>
+                    <div className="cell-sub">{agent.description ?? '未上报职责说明'}</div>
+                  </td>
                   <td>
                     <span className="badge neutral">{agent.runtime}</span>
                     {agent.device?.runtimeVersion && (
@@ -165,8 +231,23 @@ export function AgentsPage({
                       <button className="link" disabled={busyId === agent.id} onClick={() => void rename(agent)}>
                         改名
                       </button>
+                      <button
+                        className="link"
+                        disabled={busyId === agent.id}
+                        onClick={() => void editDescription(agent)}
+                      >
+                        改描述
+                      </button>
                       <button className="link" disabled={busyId === agent.id} onClick={() => void toggleStatus(agent)}>
                         {agent.status === 'active' ? '禁用' : '启用'}
+                      </button>
+                      <button
+                        className="link"
+                        disabled={busyId === agent.id}
+                        onClick={() => void syncProfile(agent)}
+                        title="重新从飞书通讯录拉姓名与头像"
+                      >
+                        同步身份
                       </button>
                       <button
                         className="link danger"
@@ -174,6 +255,9 @@ export function AgentsPage({
                         onClick={() => void kick(agent)}
                       >
                         强制下线
+                      </button>
+                      <button className="link danger" disabled={busyId === agent.id} onClick={() => void remove(agent)}>
+                        删除
                       </button>
                     </div>
                   </td>

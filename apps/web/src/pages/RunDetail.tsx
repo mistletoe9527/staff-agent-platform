@@ -53,6 +53,7 @@ export function RunDetailPage({
             {formatTime(run.createdAt)} · 耗时 {formatDuration(run.durationMs)} · 输入 {run.inputTokens} / 输出{' '}
             {run.outputTokens} tokens
           </p>
+          <p className="sub mono">工作区：{run.cwd ?? '未指定（用主工作目录）'}</p>
         </div>
       </header>
 

@@ -1,6 +1,13 @@
 import { z } from 'zod';
 
 /**
+ * 可选变量的统一处理：`.env` 里写成 `KEY=` 时会得到空字符串，
+ * 直接交给 `.url()` / `.min(1)` 会校验失败，这里统一按“未配置”处理。
+ */
+const emptyAsUndefined = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((v) => (typeof v === 'string' && v.trim() === '' ? undefined : v), schema.optional());
+
+/**
  * 平台配置：全部来自环境变量，代码里不出现任何飞书凭证。
  * 校验失败直接退出进程，避免半配置状态跑起来。
  */
@@ -16,11 +23,11 @@ const EnvSchema = z.object({
    * 对外可访问地址，例如 https://agent.example.com。
    * 配置后绑定流程额外提供二维码；不配置则只有 6 位绑定码。
    */
-  PUBLIC_BASE_URL: z.string().url().optional(),
+  PUBLIC_BASE_URL: emptyAsUndefined(z.string().url()),
 
   /** 飞书应用凭证 */
-  FEISHU_APP_ID: z.string().min(1).optional(),
-  FEISHU_APP_SECRET: z.string().min(1).optional(),
+  FEISHU_APP_ID: emptyAsUndefined(z.string().min(1)),
+  FEISHU_APP_SECRET: emptyAsUndefined(z.string().min(1)),
   /** 是否启用飞书长连接；本地联调可关掉 */
   FEISHU_ENABLED: z
     .enum(['true', 'false'])
@@ -32,12 +39,12 @@ const EnvSchema = z.object({
    * 飞书网页授权回调地址，例如 https://agent.example.com/bind/callback。
    * 配置后扫码可以一步完成绑定；不配置则二维码只展示绑定码。
    */
-  FEISHU_OAUTH_REDIRECT_URI: z.string().url().optional(),
+  FEISHU_OAUTH_REDIRECT_URI: emptyAsUndefined(z.string().url()),
 
   /** 管理后台登录口令 */
   ADMIN_PASSWORD: z.string().min(8),
   /** 管理后台 Cookie 签名密钥，留空则用 ADMIN_PASSWORD 派生 */
-  ADMIN_SESSION_SECRET: z.string().min(16).optional(),
+  ADMIN_SESSION_SECRET: emptyAsUndefined(z.string().min(16)),
 
   /** 单次任务最长执行时间（秒），超时由网关侧中断 */
   AGENT_TIMEOUT_SEC: z.coerce.number().int().positive().default(1800),

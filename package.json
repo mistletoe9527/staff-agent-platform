@@ -14,7 +14,10 @@
     "dev:web": "pnpm --filter @staff-agent/web dev",
     "typecheck": "pnpm -r typecheck",
     "db:migrate": "pnpm --filter @staff-agent/platform migrate",
-    "bridge": "pnpm --filter @staff-agent/bridge dev"
+    "bridge": "pnpm --filter @staff-agent/bridge dev",
+    "bridge:build": "pnpm --filter @staff-agent/bridge build",
+    "bridge:link": "pnpm --filter @staff-agent/bridge build && npm install -g ./packages/bridge",
+    "bridge:pack": "pnpm --filter @staff-agent/bridge build && pnpm --filter @staff-agent/bridge pack --pack-destination .pack"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

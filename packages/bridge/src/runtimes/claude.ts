@@ -3,7 +3,18 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RunOptions, RunOutcome, RuntimeAdapter } from './types.js';
 import { extractText, readNumber, summarize } from './types.js';
-import { bindAbort, killProcess, readJsonLines, spawnCli, waitExit, writeStdin } from './process.js';
+import {
+  bindAbort,
+  cliEnv,
+  describeSpawnFailure,
+  killProcess,
+  planSpawn,
+  readChildJsonLines,
+  resolveExecutable,
+  spawnCli,
+  waitExit,
+  writeStdin,
+} from './process.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -22,7 +33,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
   /** 检查 claude 是否可用。 */
   async check(): Promise<{ ok: boolean; version?: string; detail?: string }> {
     try {
-      const { stdout } = await execFileAsync(this.bin, ['--version'], { timeout: 10_000 });
+      const bin = resolveExecutable(this.bin) ?? this.bin;
+      const { stdout } = await execFileAsync(bin, ['--version'], { timeout: 10_000, env: cliEnv(bin) });
       return { ok: true, version: stdout.trim().split('\n')[0] };
     } catch (error) {
       return { ok: false, detail: error instanceof Error ? error.message : String(error) };
@@ -41,8 +53,13 @@ export class ClaudeAdapter implements RuntimeAdapter {
     } else {
       args.push('--session-id', sessionRef);
     }
+    // 先校验可执行文件与工作目录，避免 spawn ENOENT 直接打挂网关
+    const plan = planSpawn(this.bin, options.cwd);
+    if (plan.error) {
+      return { ok: false, result: '', sessionRef, inputTokens: 0, outputTokens: 0, error: plan.error };
+    }
 
-    const child = spawnCli(this.bin, args, { cwd: options.cwd });
+    const child = spawnCli(plan.command, args, { cwd: options.cwd });
     const unbind = bindAbort(child, options.signal);
 
     let finalText = '';
@@ -60,7 +77,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     writeStdin(child, options.prompt);
 
     try {
-      for await (const event of readJsonLines(child.stdout as NodeJS.ReadableStream)) {
+      for await (const event of readChildJsonLines(child)) {
         const type = String(event.type ?? '');
         if (type === 'system') {
           if (event.subtype === 'init' && typeof event.session_id === 'string') {
@@ -132,6 +149,10 @@ export class ClaudeAdapter implements RuntimeAdapter {
     }
 
     const exit = await waitExit(child);
+    const spawnError = describeSpawnFailure(child, this.bin, options.cwd);
+    if (spawnError) {
+      return { ok: false, result: finalText, sessionRef: sessionId, inputTokens, outputTokens, error: spawnError };
+    }
     if (failure) {
       return { ok: false, result: finalText, sessionRef: sessionId, inputTokens, outputTokens, error: failure };
     }

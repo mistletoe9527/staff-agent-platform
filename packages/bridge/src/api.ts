@@ -35,9 +35,10 @@ export class PlatformApi {
     private readonly token: string | null = null,
   ) {}
 
-  /** 设置/替换设备令牌（登录完成后使用）。 */
-  private authHeaders(): Record<string, string> {
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
+  /** 设置/替换设备令牌。只有带 body 的请求才声明 JSON，否则 Fastify 会认为空 body 非法。 */
+  private authHeaders(hasBody: boolean): Record<string, string> {
+    const headers: Record<string, string> = { accept: 'application/json' };
+    if (hasBody) headers['content-type'] = 'application/json';
     if (this.token) headers.authorization = `Bearer ${this.token}`;
     return headers;
   }
@@ -58,7 +59,15 @@ export class PlatformApi {
    * @param signal 中断信号（退出时取消挂起请求）
    */
   async poll(
-    payload: { state: 'idle' | 'busy'; activeRuns: number; runtimeVersion?: string; bridgeVersion?: string },
+    payload: {
+      state: 'idle' | 'busy';
+      activeRuns: number;
+      runtimeVersion?: string;
+      bridgeVersion?: string;
+      /** 主工作区目录与职责：平台只用来展示，不参与路由 */
+      cwd?: string;
+      description?: string | null;
+    },
     signal: AbortSignal,
   ): Promise<PollResponse> {
     return this.request<PollResponse>('POST', '/api/bridge/poll', payload, {
@@ -99,14 +108,15 @@ export class PlatformApi {
       try {
         const response = await fetch(`${this.baseUrl.replace(/\/$/, '')}${path}`, {
           method,
-          headers: this.authHeaders(),
+          headers: this.authHeaders(body !== undefined),
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: controller.signal,
         });
         const text = await response.text();
         const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
         if (!response.ok) {
-          const message = typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`;
+          // 平台自己的错误放在 error；Fastify 内置错误（400/413 等）真正的原因在 message
+          const message = errorMessage(payload, response.status);
           const code = typeof payload.code === 'string' ? payload.code : undefined;
           // 4xx 是业务错误，重试没有意义
           if (response.status >= 400 && response.status < 500) {
@@ -129,6 +139,15 @@ export class PlatformApi {
     }
     throw lastError instanceof Error ? lastError : new Error('请求平台失败');
   }
+}
+
+/** 从错误响应里拼出可读原因：`error` 是平台业务码，Fastify 的 `message` 才是具体原因。 */
+function errorMessage(payload: Record<string, unknown>, status: number): string {
+  const parts = [payload.error, payload.message]
+    .filter((part): part is string => typeof part === 'string' && part.trim() !== '')
+    // Fastify 的 error 就是「Bad Request」这种泛化短语，和 message 重复时只留一个
+    .filter((part, index, all) => index === 0 || part !== all[0]);
+  return parts.length > 0 ? parts.join(': ') : `HTTP ${status}`;
 }
 
 /** 判断任务包是否完整（防御性检查，避免平台协议变更导致网关崩溃）。 */

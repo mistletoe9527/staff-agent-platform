@@ -1,7 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import type { RunOptions, RunOutcome, RuntimeAdapter, StepEvent } from './types.js';
 import { extractText, readNumber, summarize } from './types.js';
-import { bindAbort, killProcess, readJsonLines, spawnCli, waitExit, writeStdin } from './process.js';
+import {
+  bindAbort,
+  cliEnv,
+  describeSpawnFailure,
+  planSpawn,
+  readChildJsonLines,
+  resolveExecutable,
+  shutdownCli,
+  spawnCli,
+  waitExit,
+  writeStdinLine,
+} from './process.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -28,7 +39,8 @@ export class PiAdapter implements RuntimeAdapter {
   /** 检查 pi 是否可用。 */
   async check(): Promise<{ ok: boolean; version?: string; detail?: string }> {
     try {
-      const { stdout } = await execFileAsync(this.bin, ['--version'], { timeout: 10_000 });
+      const bin = resolveExecutable(this.bin) ?? this.bin;
+      const { stdout } = await execFileAsync(bin, ['--version'], { timeout: 10_000, env: cliEnv(bin) });
       return { ok: true, version: stdout.trim().split('\n')[0] };
     } catch (error) {
       return { ok: false, detail: error instanceof Error ? error.message : String(error) };
@@ -40,7 +52,12 @@ export class PiAdapter implements RuntimeAdapter {
     const sessionRef = options.sessionRef ?? randomUUID();
     const extraArgs = (process.env.STAFF_AGENT_PI_ARGS ?? '').split(' ').filter(Boolean);
     const args = ['--mode', 'rpc', '--session-id', sessionRef, ...extraArgs];
-    const child = spawnCli(this.bin, args, { cwd: options.cwd });
+    // 先校验可执行文件与工作目录，避免 spawn ENOENT 直接打挂网关
+    const plan = planSpawn(this.bin, options.cwd);
+    if (plan.error) {
+      return { ok: false, result: '', sessionRef, inputTokens: 0, outputTokens: 0, error: plan.error };
+    }
+    const child = spawnCli(plan.command, args, { cwd: options.cwd });
     const unbind = bindAbort(child, options.signal);
 
     let finalText = '';
@@ -56,11 +73,12 @@ export class PiAdapter implements RuntimeAdapter {
       stderrTail = `${stderrTail}${chunk.toString('utf8')}`.slice(-4000);
     });
 
-    // prompt 必须在开始读事件前写入，避免极快的完成事件被漏掉
-    writeStdin(child, `${JSON.stringify({ id: 'prompt-1', type: 'prompt', message: options.prompt })}\n`);
+    // prompt 必须在开始读事件前写入，避免极快的完成事件被漏掉。
+    // 注意不能 end()：RPC 模式 stdin EOF 会让 pi 在本轮跑完前就退出。
+    writeStdinLine(child, `${JSON.stringify({ id: 'prompt-1', type: 'prompt', message: options.prompt })}\n`);
 
     try {
-      for await (const event of readJsonLines(child.stdout as NodeJS.ReadableStream)) {
+      for await (const event of readChildJsonLines(child)) {
         const type = String(event.type ?? '');
         switch (type) {
           case 'tool_execution_start': {
@@ -107,13 +125,17 @@ export class PiAdapter implements RuntimeAdapter {
             if (message?.role !== 'assistant') break;
             const text = extractText(message.content);
             if (text) finalText = text;
-            inputTokens += readNumber(message.usage, 'inputTokens', 'input_tokens');
-            outputTokens += readNumber(message.usage, 'outputTokens', 'output_tokens');
+            // pi 的 usage 键名是 input / output，兼容其他运行时风格
+            inputTokens += readNumber(message.usage, 'inputTokens', 'input_tokens', 'input');
+            outputTokens += readNumber(message.usage, 'outputTokens', 'output_tokens', 'output');
             break;
           }
           case 'turn_end': {
-            inputTokens += readNumber(event.usage, 'inputTokens', 'input_tokens');
-            outputTokens += readNumber(event.usage, 'outputTokens', 'output_tokens');
+            // turn_end.usage 是本轮汇总，优先级高于逐条 message_end 累加，避免重复计数
+            const turnInput = readNumber(event.usage, 'inputTokens', 'input_tokens', 'input');
+            const turnOutput = readNumber(event.usage, 'outputTokens', 'output_tokens', 'output');
+            if (turnInput > 0) inputTokens = turnInput;
+            if (turnOutput > 0) outputTokens = turnOutput;
             break;
           }
           case 'response': {
@@ -138,14 +160,20 @@ export class PiAdapter implements RuntimeAdapter {
           default:
             break;
         }
+        // agent_settled 表示本轮真正结束；pi 是长驻进程，不主动跳出会一直等 stdin
+        if (settled) break;
       }
     } finally {
       unbind();
-      killProcess(child);
+      await shutdownCli(child);
     }
 
     const exit = await waitExit(child);
     const resultText = (finalText || streamedText).trim();
+    const spawnError = describeSpawnFailure(child, this.bin, options.cwd);
+    if (spawnError) {
+      return { ok: false, result: resultText, sessionRef, inputTokens, outputTokens, error: spawnError };
+    }
     if (promptError) {
       return {
         ok: false,

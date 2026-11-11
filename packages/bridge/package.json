@@ -5,6 +5,7 @@
   "type": "module",
   "description": "本地 Agent 网关：把公司平台的任务交给本机 pi / Claude Code / Codex 执行，并回传 trace",
   "bin": {
+    "sa": "./dist/cli.js",
     "staff-agent": "./dist/cli.js"
   },
   "files": [
@@ -19,12 +20,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@staff-agent/shared": "workspace:*",
     "commander": "^13.0.0",
     "qrcode-terminal": "^0.12.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@staff-agent/shared": "workspace:*",
     "@types/node": "^22.10.2",
     "@types/qrcode-terminal": "^0.12.2",
     "tsup": "^8.3.5",

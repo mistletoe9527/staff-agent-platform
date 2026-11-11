@@ -19,7 +19,7 @@ export const POLL_HOLD_MS = 25_000;
 export const RUN_LEASE_MS = 120_000;
 
 /**
- * 本地网关注册请求：员工首次运行 `staff-agent login` 时发出。
+ * 本地网关注册请求：员工首次运行 `sa login` 时发出。
  * 只登记设备与运行时，尚未绑定飞书身份，返回的绑定码由员工发到飞书完成绑定。
  */
 export const RegisterRequestSchema = z.object({
@@ -71,6 +71,10 @@ export const PollRequestSchema = z.object({
   activeRuns: z.number().int().min(0).max(64),
   runtimeVersion: z.string().max(64).optional(),
   bridgeVersion: z.string().max(64).optional(),
+  /** 主工作区目录（本机绝对路径）；变了平台才会更新，用于后台展示 */
+  cwd: z.string().max(512).optional(),
+  /** 主工作区职责说明，跟着 cwd 一起上报 */
+  description: z.string().max(500).nullable().optional(),
 });
 export type PollRequest = z.infer<typeof PollRequestSchema>;
 
@@ -78,6 +82,9 @@ export type PollRequest = z.infer<typeof PollRequestSchema>;
 export const RunAssignmentSchema = z.object({
   runId: z.string(),
   leaseId: z.string(),
+  /** 执行本任务的 Agent（同一台机器可能有多个 Agent） */
+  agentId: z.string().optional(),
+  agentName: z.string().optional(),
   /** 飞书会话标识，用于把多轮消息串成同一段上下文 */
   conversationId: z.string(),
   /** 传给运行时的续聊标识（pi session id / claude session id / codex thread id） */
@@ -144,6 +151,8 @@ export const RunReportRequestSchema = z.object({
   outputTokens: z.number().int().min(0).optional(),
   /** 运行时返回的会话标识，下轮任务续聊使用 */
   sessionRef: z.string().max(256).nullable().optional(),
+  /** 实际执行目录：工作区路由在本地决定，平台只做记录与展示 */
+  cwd: z.string().max(512).nullable().optional(),
 });
 export type RunReportRequest = z.infer<typeof RunReportRequestSchema>;
 
@@ -164,8 +173,18 @@ export interface AgentView {
   id: string;
   name: string;
   feishuOpenId: string;
+  /** 飞书姓名（绑定时同步；无通讯录权限时为空） */
+  feishuName: string | null;
+  /** 飞书头像 URL（绑定时同步；无权限时为空） */
+  feishuAvatarUrl: string | null;
   runtime: AgentRuntime;
   status: AgentStatus;
+  /** 恒为 true：平台侧只存在主 Agent（数字员工），子工作区只在本机 */
+  isPrimary: boolean;
+  /** 工作目录（员工机器上的绝对路径） */
+  cwd: string | null;
+  /** 工作区说明 */
+  description: string | null;
   createdAt: string;
   device: {
     id: string;
@@ -186,6 +205,8 @@ export interface RunView {
   agentName: string;
   status: RunStatus;
   promptPreview: string;
+  /** 本次任务实际执行的工作目录（主工作区或某个子工作区） */
+  cwd: string | null;
   createdAt: string;
   endedAt: string | null;
   durationMs: number | null;

@@ -78,7 +78,7 @@ async function main(): Promise<void> {
   }));
 
   registerBridgeRoutes(app, { db, config, inbox, enroll, notifier, logger });
-  registerAdminRoutes(app, { db, config, logger });
+  registerAdminRoutes(app, { db, config, feishu, logger });
   registerBindRoutes(app, { config, enroll, oauth, logger });
 
   // 前端单页应用回退；/api 下的 404 保持 JSON
@@ -168,6 +168,17 @@ process.on('uncaughtException', (error) => {
 });
 
 main().catch((error: unknown) => {
-  process.stderr.write(`${JSON.stringify({ level: 'error', msg: '平台启动失败', err: errorText(error) })}\n`);
+  const text = errorText(error);
+  process.stderr.write(`${JSON.stringify({ level: 'error', msg: '平台启动失败', err: text })}\n`);
+  // 端口被占用是最常见的本地开发故障（常见原因：docker compose 起的同名容器还在跑）
+  if (text.includes('EADDRINUSE')) {
+    const port = process.env.PORT ?? '8787';
+    process.stderr.write(
+      `${JSON.stringify({
+        level: 'error',
+        msg: `端口 ${port} 已被占用：先停掉占用它的进程（docker compose stop platform / lsof -nP -iTCP:${port} -sTCP:LISTEN），或用 PORT=${Number(port) + 1} 换端口启动`,
+      })}\n`,
+    );
+  }
   process.exit(1);
 });

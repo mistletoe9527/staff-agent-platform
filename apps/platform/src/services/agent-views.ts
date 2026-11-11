@@ -14,19 +14,22 @@ export interface AgentListFilter {
 /**
  * 组装管理后台的 Agent 视图。
  * 设备与 7 日统计都批量取回后内存合并，避免每个 Agent 两次查询（N+1）。
+ * 只返回主 Agent：子 Agent 只是员工本机的工作区，不进后台。
  */
 export function listAgentViews(db: Db, filter: AgentListFilter): AgentView[] {
   const where: string[] = [];
   const params: Array<string> = [];
   if (filter.q) {
-    where.push('(name LIKE ? OR feishu_open_id LIKE ? OR feishu_name LIKE ?)');
+    where.push('(name LIKE ? OR feishu_open_id LIKE ? OR feishu_name LIKE ? OR description LIKE ? OR cwd LIKE ?)');
     const like = `%${filter.q}%`;
-    params.push(like, like, like);
+    params.push(like, like, like, like, like);
   }
   if (filter.status) {
     where.push('status = ?');
     params.push(filter.status);
   }
+  // 平台只展示「数字员工」= 主 Agent；子 Agent 是员工本机的工作区，不属于管理后台视角
+  where.push('is_primary = 1');
   const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
   const rows = db
     .prepare(`SELECT * FROM agents ${clause} ORDER BY created_at DESC`)
@@ -45,8 +48,13 @@ export function listAgentViews(db: Db, filter: AgentListFilter): AgentView[] {
       id: row.id,
       name: row.name,
       feishuOpenId: row.feishu_open_id,
+      feishuName: row.feishu_name,
+      feishuAvatarUrl: row.feishu_avatar ?? null,
       runtime: row.runtime,
       status: row.status,
+      isPrimary: row.is_primary === 1,
+      cwd: row.cwd,
+      description: row.description,
       createdAt: row.created_at,
       device: device
         ? {

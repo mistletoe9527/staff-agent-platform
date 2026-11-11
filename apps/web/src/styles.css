@@ -213,6 +213,22 @@ input:focus, select:focus { border-color: var(--accent); }
 .table tbody tr:hover { background: var(--panel-2); }
 .table tr.clickable { cursor: pointer; }
 .cell-main { display: flex; align-items: center; gap: 8px; }
+.avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex: 0 0 auto;
+  background: var(--panel-2);
+}
+.avatar-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
 .cell-sub { font-size: 12px; color: var(--text-mute); }
 .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .link { background: transparent; border: 0; padding: 0; color: var(--accent); font-size: 13px; }

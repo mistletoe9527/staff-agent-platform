@@ -11,6 +11,7 @@ import {
 import type { Config } from '../config.js';
 import type { Db } from '../db/client.js';
 import { findActiveDeviceByAgent, findDeviceByTokenHash, touchDevice, upsertDevice, type Device } from '../domain/devices.js';
+import { findAgentById, updateAgent } from '../domain/agents.js';
 import { createEnrollCode } from '../domain/enroll.js';
 import { ackRun, finishRun, type Run, type RunRow } from '../domain/runs.js';
 import { updateConversationSession } from '../domain/conversations.js';
@@ -48,15 +49,21 @@ function authenticate(request: FastifyRequest, db: Db): Device | null {
   return findDeviceByTokenHash(db, sha256(token));
 }
 
-/** 把任务实体转成网关可执行的任务包。 */
+/**
+ * 把任务实体转成网关可执行的任务包。
+ *
+ * 平台不再拼工作区说明、也不再解析 `#名字`：工作区路由全部发生在员工本机
+ * （网关读本地配置决定 cwd），这里只把任务原样下发。
+ */
 function toAssignment(run: Run, config: Config): RunAssignment {
   return {
     runId: run.id,
     leaseId: run.leaseId as string,
+    agentId: run.agentId,
     conversationId: run.conversationId,
     sessionRef: run.sessionRef,
     prompt: run.prompt,
-    cwd: null,
+    cwd: run.cwd,
     timeoutSec: config.AGENT_TIMEOUT_SEC,
     createdAt: run.createdAt,
   };
@@ -114,22 +121,31 @@ export function registerBridgeRoutes(app: FastifyInstance, deps: BridgeRouteDeps
       return unauthorized(reply, '该设备已被替换或撤销，请重新登录');
     }
 
+    // 主工作区是本机概念：网关每次心跳带上当前目录，变了才写库，后台跟着变
+    const account = findAgentById(db, device.agentId);
+    if (account) {
+      if (parsed.data.cwd && parsed.data.cwd !== account.cwd) {
+        updateAgent(db, account.id, { cwd: parsed.data.cwd });
+      }
+      if (parsed.data.description !== undefined && parsed.data.description !== account.description) {
+        updateAgent(db, account.id, { description: parsed.data.description });
+      }
+    }
+
     touchDevice(db, device.id, {
       bridgeState: parsed.data.state,
       runtimeVersion: parsed.data.runtimeVersion ?? null,
       bridgeVersion: parsed.data.bridgeVersion ?? null,
     });
 
+    // 一台设备对应一个 Agent（数字员工），任务按设备排队
     const run = await inbox.claim({
-      agentId: device.agentId,
+      agentIds: [device.agentId],
       deviceId: device.id,
       leaseMs: config.RUN_LEASE_MS,
       holdMs: config.POLL_HOLD_MS,
     });
-    return {
-      run: run ? toAssignment(run, config) : null,
-      serverTime: new Date().toISOString(),
-    };
+    return { run: run ? toAssignment(run, config) : null, serverTime: new Date().toISOString() };
   });
 
   // 认领确认，刷新租约
@@ -189,6 +205,7 @@ export function registerBridgeRoutes(app: FastifyInstance, deps: BridgeRouteDeps
       inputTokens: parsed.data.inputTokens ?? 0,
       outputTokens: parsed.data.outputTokens ?? 0,
       sessionRef: parsed.data.sessionRef ?? null,
+      cwd: parsed.data.cwd ?? null,
     });
     if (!updated) {
       return reply.code(409).send({ ok: false, error: '租约已失效或任务已结束', code: 'LEASE_LOST' });

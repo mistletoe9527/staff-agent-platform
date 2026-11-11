@@ -120,6 +120,66 @@ CREATE TABLE audit_logs (
 CREATE INDEX idx_audit_created ON audit_logs (created_at);
 `,
   },
+  {
+    version: 2,
+    name: 'agent-workspaces',
+    // 一个飞书人可以有多台/多个 Agent：主 Agent 绑定时创建，其余在客户端新增。
+    // SQLite 改不了列上的 UNIQUE，只能重建表；旧数据里每个用户只有一个 Agent，全部标为主 Agent。
+    sql: `
+CREATE TABLE agents_v2 (
+  id TEXT PRIMARY KEY,
+  feishu_open_id TEXT NOT NULL,
+  feishu_name TEXT,
+  name TEXT NOT NULL,
+  runtime TEXT NOT NULL,
+  status TEXT NOT NULL,
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  device_id TEXT,
+  cwd TEXT,
+  description TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+INSERT INTO agents_v2 (id, feishu_open_id, feishu_name, name, runtime, status, is_primary, device_id, cwd, description, created_at, updated_at)
+SELECT a.id, a.feishu_open_id, a.feishu_name, a.name, a.runtime, a.status, 1,
+       (SELECT d.id FROM devices d
+         WHERE d.agent_id = a.id AND d.status = 'active'
+         ORDER BY COALESCE(d.last_seen_at, '') DESC LIMIT 1),
+       NULL, NULL, a.created_at, a.updated_at
+FROM agents a;
+
+DROP TABLE agents;
+ALTER TABLE agents_v2 RENAME TO agents;
+
+CREATE INDEX idx_agents_open_id ON agents (feishu_open_id);
+CREATE INDEX idx_agents_device ON agents (device_id);
+-- 每个飞书人只能有一个主 Agent
+CREATE UNIQUE INDEX idx_agents_primary ON agents (feishu_open_id) WHERE is_primary = 1;
+`,
+  },
+  {
+    version: 3,
+    name: 'run-cwd',
+    // 任务可能被派到某个子工作区执行，把实际工作目录记在任务上，便于追溯与重放
+    sql: `ALTER TABLE runs ADD COLUMN cwd TEXT;`,
+  },
+  {
+    version: 4,
+    name: 'feishu-avatar',
+    // 绑定后把飞书头像也同步过来，后台一眼能认出是谁的数字员工；拿不到权限时留空
+    sql: `ALTER TABLE agents ADD COLUMN feishu_avatar TEXT;`,
+  },
+  {
+    version: 5,
+    name: 'local-workspaces',
+    // 子 Agent 下沉到员工本机：平台只保留主 Agent（数字员工），
+    // 存量子 Agent 记录的 cwd 是本机路径，对平台没有任何价值，直接清掉。
+    sql: `
+DELETE FROM agents WHERE is_primary = 0;
+DROP INDEX IF EXISTS idx_agents_device;
+`,
+  },
 ];
 
 /**
