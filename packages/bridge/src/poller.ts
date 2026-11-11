@@ -4,9 +4,10 @@ import type { ConfigHandle } from './config.js';
 import { Runner } from './runner.js';
 import { log, errorText } from './log.js';
 import { createAdapter } from './runtimes/index.js';
+import { BRIDGE_VERSION } from './version.js';
 
-/** 网关版本，随包发布。 */
-export const BRIDGE_VERSION = '0.1.0';
+/** 网关版本，随包发布（唯一来源是 version.ts）。 */
+export { BRIDGE_VERSION };
 
 /**
  * 长轮询主循环。

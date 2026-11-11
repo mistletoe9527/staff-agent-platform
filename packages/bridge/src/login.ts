@@ -5,6 +5,7 @@ import { PlatformApi } from './api.js';
 import { readConfig, writeConfig } from './config.js';
 import { log, errorText, machineId, machineName } from './log.js';
 import { createAdapter } from './runtimes/index.js';
+import { BRIDGE_VERSION } from './version.js';
 import { defaultWorkspaceDir, ensureDir, prettyPath } from './workspaces.js';
 
 /** 登录参数。 */
@@ -64,7 +65,7 @@ export async function login(options: LoginOptions): Promise<void> {
     machineName: machine,
     runtime: options.runtime,
     runtimeVersion: check.version,
-    bridgeVersion: '0.1.0',
+    bridgeVersion: BRIDGE_VERSION,
   });
 
   process.stdout.write('\n');

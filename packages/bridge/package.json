@@ -1,6 +1,6 @@
 {
   "name": "@staff-agent/bridge",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "本地 Agent 网关：把公司平台的任务交给本机 pi / Claude Code / Codex 执行，并回传 trace",
