@@ -1,0 +1,12 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  protobufjs: true
+
+# 允许这些依赖执行安装脚本（esbuild / protobufjs 需要下载/编译原生二进制）
+onlyBuiltDependencies:
+  - esbuild
+  - protobufjs

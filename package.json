@@ -1,0 +1,24 @@
+{
+  "name": "staff-agent-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "企业私有化个人 Agent 平台：飞书下发任务，本地 Agent 执行，平台统一观测",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter @staff-agent/platform dev",
+    "dev:web": "pnpm --filter @staff-agent/web dev",
+    "typecheck": "pnpm -r typecheck",
+    "db:migrate": "pnpm --filter @staff-agent/platform migrate",
+    "bridge": "pnpm --filter @staff-agent/bridge dev"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

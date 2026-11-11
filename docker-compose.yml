@@ -1,0 +1,27 @@
+services:
+  platform:
+    build: .
+    image: staff-agent-platform:latest
+    container_name: staff-agent-platform
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8787}:8787"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - staff-agent-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  staff-agent-data:
