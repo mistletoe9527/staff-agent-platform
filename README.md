@@ -21,6 +21,7 @@ Tasks come in from Feishu, run locally on the employee's machine, and every step
 - [Feishu app setup](#feishu-app-setup)
 - [Employee side: connect your own agent](#employee-side-connect-your-own-agent)
 - [Using it in Feishu](#using-it-in-feishu)
+- [Skill marketplace](#skill-marketplace)
 - [Binding, workspaces, and one-to-one constraints](#binding-workspaces-and-one-to-one-constraints)
 - [Tracing](#tracing)
 - [Protocol (bridge ↔ platform)](#protocol-bridge--platform)
@@ -111,6 +112,7 @@ QR-code binding (optional; requires the phone to reach the platform URL):
 | Web app capability | Enabled |
 | Security → Redirect URL | `https://<your-domain>/bind/callback` |
 | Environment | `PUBLIC_BASE_URL=https://<your-domain>`, `FEISHU_OAUTH_REDIRECT_URI=https://<your-domain>/bind/callback` |
+| Skill marketplace employee login (optional) | Web app capability; add `https://<your-domain>/api/auth/feishu/callback` under Security → Redirect URL |
 
 Without these two settings the QR page only shows the binding code — the employee sends it to the
 bot in Feishu and everything still works.
@@ -249,6 +251,45 @@ never proxies model calls and never stores model keys.
 | Explicit workspace | `#frontend convert the login page to the new design` — runs in that directory (`#name` resolved locally) |
 | List workspaces | `#list` is answered locally (no model tokens), listing the primary + custom workspaces, directories and responsibilities |
 
+## Skill marketplace
+
+The console ships with a lightweight internal Skill marketplace: employees upload reusable agent
+skill packages, and everyone else can download them after signing in.
+
+- **Two identities**: employees sign in with Feishu web authorization and only see the marketplace;
+  admins sign in with `ADMIN_PASSWORD` and can access the full console and moderate every Skill.
+  Without Feishu web login configured, admins can still upload and manage Skills.
+- **Upload formats**: a zip, a single `SKILL.md`, or a Skill folder selected in the browser (zipped
+  locally). The server strips a single top-level directory so the downloaded package always has
+  `SKILL.md` at its root.
+- **Validation**: absolute paths and `..` traversal are rejected, `SKILL.md` is required, and
+  compressed size, extracted size and file count are capped by `SKILL_MAX_BYTES`,
+  `SKILL_MAX_EXTRACTED_BYTES` and `SKILL_MAX_FILES`.
+- **Versions**: the first upload creates the Skill; later uploads append versions. Old versions
+  remain downloadable, and downloads default to the latest.
+- **Permissions**: authors can edit metadata, publish new versions and delete their own Skills;
+  admins can hide / restore / delete any Skill. Hidden Skills are visible only to the author and
+  admins.
+- **Storage**: metadata lives in SQLite (`skills` / `skill_versions` / `skill_downloads`); packages
+  live under `${DATA_DIR}/skills/<skill-id>/<version-id>.zip`, so backing up `DATA_DIR` includes them.
+
+For employee Feishu login, add `https://<your-domain>/api/auth/feishu/callback` to the Feishu app's
+**Security → Redirect URL** list (or set `FEISHU_WEB_REDIRECT_URI` explicitly) and enable the web
+app capability. The login page then shows **Sign in with Feishu**.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/auth/me` | Current identity and whether Feishu login is enabled |
+| GET | `/api/auth/feishu/start` | Redirect to Feishu web authorization |
+| GET | `/api/auth/feishu/callback` | Feishu callback; sets the employee session |
+| GET | `/api/skills` | List / search / categories / pagination |
+| POST | `/api/skills?name=&version=&...` | Publish the first version (raw zip / markdown body) |
+| GET | `/api/skills/:id` | Detail and version history |
+| POST | `/api/skills/:id/versions` | Publish a new version |
+| PATCH | `/api/skills/:id` | Edit metadata; admins may change status |
+| DELETE | `/api/skills/:id?confirm=<name>` | Delete a Skill |
+| GET | `/api/skills/:id/download?version=` | Download a version (latest by default) |
+
 ## Binding, workspaces, and one-to-one constraints
 
 - **One Feishu person, one primary agent**, with exactly one machine online at a time (a new device
@@ -333,7 +374,10 @@ link, one less place for state to drift.
 | `conversations` | Agent + Feishu conversation + thread → runtime sessionRef (multi-turn continuation) |
 | `runs` | Run record, lease, usage, final result |
 | `steps` | Step-level trace, unique `(run_id, seq)` |
-| `audit_logs` | Admin action audit |
+| `skills` | Skill aggregate: name, summary, category, tags, owner, status, total downloads |
+| `skill_versions` | One zip per version: version, size, SHA-256, file list, SKILL.md preview, downloads |
+| `skill_downloads` | Download records for auditing and statistics |
+| `audit_logs` | Admin and employee action audit |
 
 Why one file: backup = copy the file; migration = runs at startup; write pressure for 500 agents
 (heartbeat ≈ 20 writes/s) is far below what a single-writer SQLite can handle.
@@ -345,7 +389,7 @@ All configuration is via environment variables; no credentials live in the repo.
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` / `HOST` | `8787` / `0.0.0.0` | Listen address |
-| `DATA_DIR` | `./data` | SQLite and log directory (`/data` in the container) |
+| `DATA_DIR` | `./data` | SQLite, logs and Skill packages (`/data` in the container) |
 | `ADMIN_PASSWORD` | required | Admin console password (≥ 8 chars) |
 | `ADMIN_SESSION_SECRET` | derived | Session and binding-code signing secret |
 | `PUBLIC_BASE_URL` | empty | Enables the QR-code binding flow |
@@ -353,6 +397,7 @@ All configuration is via environment variables; no credentials live in the repo.
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | required | Feishu self-built app credentials |
 | `FEISHU_OPEN_BASE` | `https://open.feishu.cn` | Use `open.larksuite.com` for Lark international |
 | `FEISHU_OAUTH_REDIRECT_URI` | empty | Callback for one-step QR binding |
+| `FEISHU_WEB_REDIRECT_URI` | derived | Employee Feishu login callback; defaults to `${PUBLIC_BASE_URL}/api/auth/feishu/callback` |
 | `AGENT_TIMEOUT_SEC` | `1800` | Per-task timeout |
 | `POLL_HOLD_MS` | `25000` | Long-poll hold time, must be below the reverse proxy idle timeout |
 | `RUN_LEASE_MS` | `120000` | Task lease; expired leases are requeued |
@@ -361,6 +406,9 @@ All configuration is via environment variables; no credentials live in the repo.
 | `ENROLL_TTL_SEC` | `300` | Binding code TTL |
 | `TRACE_RETENTION_DAYS` | `7` | Step detail retention |
 | `TRACE_MAX_SUMMARY_CHARS` | `2000` | Max characters per trace summary |
+| `SKILL_MAX_BYTES` | `20971520` | Max compressed Skill package size (20 MB) |
+| `SKILL_MAX_EXTRACTED_BYTES` | `83886080` | Max extracted Skill package size (80 MB) |
+| `SKILL_MAX_FILES` | `800` | Max files in a Skill package |
 | `LOG_LEVEL` | `info` | `info` / `warn` / `error` |
 
 On the gateway side: `STAFF_AGENT_HOME` (data directory),
@@ -405,12 +453,12 @@ staff-agent-platform/
 │   ├── platform/            # platform service
 │   │   └── src/
 │   │       ├── db/          # SQLite connection and migrations
-│   │       ├── domain/      # agents / devices / runs / steps / enroll
+│   │       ├── domain/      # agents / devices / runs / steps / enroll / skills
 │   │       ├── feishu/      # WebSocket client, web authorization
-│   │       ├── http/        # bridge / admin / bind routes
-│   │       ├── services/    # binding, dispatch, outbox, result notification
+│   │       ├── http/        # bridge / admin / auth / skills / bind routes
+│   │       ├── services/    # binding, dispatch, outbox, notifications, skill storage, web sessions
 │   │       └── trace/       # redaction, statistics
-│   └── web/                 # admin console (React + Vite)
+│   └── web/                 # admin console + Skill marketplace (React + Vite)
 ├── packages/
 │   ├── shared/              # protocol types and zod schemas (server, web, gateway)
 │   └── bridge/              # employee-side npm package (CLI + 3 runtime adapters)
@@ -433,6 +481,8 @@ staff-agent-platform/
   to the primary agent).
 - The platform does not proxy model calls; model quota and credentials are managed by each employee's
   local CLI.
+- The Skill marketplace shares packages by signed-in identity and has no approval workflow or secret
+  scanning; make sure packages contain no credentials or sensitive internal data before uploading.
 
 ---
 

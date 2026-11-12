@@ -1,4 +1,3 @@
-import { createHmac } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AgentStatus, RunStatus } from '@staff-agent/shared';
@@ -12,14 +11,10 @@ import { revokeDevicesByAgent } from '../domain/devices.js';
 import { findRunById, listRuns } from '../domain/runs.js';
 import { listSteps } from '../domain/steps.js';
 import { listAgentViews } from '../services/agent-views.js';
+import { ADMIN_COOKIE, ADMIN_SESSION_TTL_MS, signAdminSession, verifyAdminSession } from '../services/web-auth.js';
 import { buildStats } from '../trace/stats.js';
 import { safeEqual } from '../util/hash.js';
 import { errorText, type Logger } from '../util/logger.js';
-
-/** 管理后台会话 Cookie 名。 */
-const SESSION_COOKIE = 'sa_admin';
-/** 会话有效期（毫秒）。 */
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 /** 管理员路由依赖。 */
 export interface AdminRouteDeps {
@@ -41,33 +36,13 @@ const AgentPatchSchema = z.object({
   description: z.string().max(500).nullable().optional(),
 });
 
-/** 生成会话令牌：过期时间 + HMAC 签名。无状态，重启不掉线。 */
-function signSession(config: Config): string {
-  const exp = String(Date.now() + SESSION_TTL_MS);
-  const signature = createHmac('sha256', config.sessionSecret).update(exp).digest('base64url');
-  return `${exp}.${signature}`;
-}
-
-/** 校验会话令牌。 */
-function verifySession(token: string | undefined, config: Config): boolean {
-  if (!token) return false;
-  const index = token.indexOf('.');
-  if (index <= 0) return false;
-  const exp = token.slice(0, index);
-  const signature = token.slice(index + 1);
-  if (!/^\d+$/.test(exp)) return false;
-  if (Number(exp) < Date.now()) return false;
-  const expected = createHmac('sha256', config.sessionSecret).update(exp).digest('base64url');
-  return safeEqual(signature, expected);
-}
-
 /** 管理后台路由。全部走 Cookie 会话，不做多级权限（私有化单租户场景）。 */
 export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps): void {
   const { db, config, feishu, logger } = deps;
 
   /** 统一鉴权。 */
   const requireAdmin = (request: FastifyRequest, reply: FastifyReply): boolean => {
-    if (verifySession(request.cookies[SESSION_COOKIE], config)) return true;
+    if (verifyAdminSession(request.cookies[ADMIN_COOKIE], config)) return true;
     void reply.code(401).send({ ok: false, error: '未登录或会话已过期', code: 'UNAUTHORIZED' });
     return false;
   };
@@ -79,11 +54,11 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
       logger.warn({ ip: request.ip }, '管理后台登录失败');
       return reply.code(401).send({ ok: false, error: '口令错误' });
     }
-    reply.setCookie(SESSION_COOKIE, signSession(config), {
+    reply.setCookie(ADMIN_COOKIE, signAdminSession(config), {
       path: '/',
       httpOnly: true,
       sameSite: 'lax',
-      maxAge: SESSION_TTL_MS / 1000,
+      maxAge: ADMIN_SESSION_TTL_MS / 1000,
       secure: config.NODE_ENV === 'production' && Boolean(config.PUBLIC_BASE_URL?.startsWith('https://')),
     });
     audit(db, { actor: `admin@${request.ip}`, action: 'admin.login' });
@@ -91,12 +66,12 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
   });
 
   app.post('/api/admin/logout', async (_request, reply) => {
-    reply.clearCookie(SESSION_COOKIE, { path: '/' });
+    reply.clearCookie(ADMIN_COOKIE, { path: '/' });
     return { ok: true };
   });
 
   app.get('/api/admin/session', async (request) => {
-    return { authenticated: verifySession(request.cookies[SESSION_COOKIE], config) };
+    return { authenticated: verifyAdminSession(request.cookies[ADMIN_COOKIE], config) };
   });
 
   // Agent 列表（设备与统计批量取回，无 N+1）

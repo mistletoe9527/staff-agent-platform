@@ -21,6 +21,7 @@
 - [飞书应用配置](#飞书应用配置)
 - [员工侧：接入自己的 Agent](#员工侧接入自己的-agent)
 - [在飞书里怎么用](#在飞书里怎么用)
+- [Skill 广场](#skill-广场)
 - [绑定、多工作区与一对一约束](#绑定多工作区与一对一约束)
 - [trace](#trace)
 - [协议（网关 ↔ 平台）](#协议网关--平台)
@@ -103,6 +104,7 @@ pnpm --filter @staff-agent/web dev            # 后台 :5173（/api 代理到 87
 | 网页应用能力 | 开启 |
 | 安全设置 → 重定向 URL | `https://<你的域名>/bind/callback` |
 | 环境变量 | `PUBLIC_BASE_URL=https://<你的域名>`、`FEISHU_OAUTH_REDIRECT_URI=https://<你的域名>/bind/callback` |
+| Skill 广场员工登录（可选） | 网页应用能力；安全设置 → 重定向 URL 增加 `https://<你的域名>/api/auth/feishu/callback` |
 
 不配这两项时，二维码页面只展示绑定码，员工把码发到飞书即可，功能不受影响。
 
@@ -226,6 +228,39 @@ sa stop
 | 指定工作区 | `#前端 帮我把登录页改成新设计`，直接在该工作区目录执行（`#名字` 由本机解析） |
 | 查看工作区 | `#列表` 由本机直接回复（不花模型 token），列出主工作区 + 工作区、目录与职责 |
 
+## Skill 广场
+
+后台内置一个轻量的员工 Skill 市场：同事把可复用的 Agent 技能包上传到平台，其他人登录后直接下载。
+
+- **两种登录方式**：员工用飞书网页授权登录，只看到 Skill 广场；管理员用 `ADMIN_PASSWORD` 登录，
+  可访问全部后台并管理所有 Skill。未配置飞书网页授权时，管理员仍可正常上传 / 管理。
+- **上传格式**：支持 zip、单个 `SKILL.md`，或直接选择 Skill 文件夹（浏览器里打包）。
+  服务端会剥掉唯一的顶层目录，保证下载包的根目录就是 `SKILL.md`。
+- **安全校验**：拒绝绝对路径 / `..` 路径穿越、缺少 `SKILL.md`、超大包、压缩炸弹和超量文件；
+  包体大小与解压体积分别由 `SKILL_MAX_BYTES` / `SKILL_MAX_EXTRACTED_BYTES` 控制。
+- **版本**：首次上传创建 Skill，后续上传新版本；历史版本保留并可单独下载，下载默认取最新版。
+- **权限**：作者可编辑信息、上传新版本、删除自己的 Skill；管理员可隐藏 / 恢复 / 删除任意 Skill。
+  隐藏后的 Skill 只有作者和管理员可见。
+- **存储**：元数据在 SQLite（`skills` / `skill_versions` / `skill_downloads`），
+  包体在 `${DATA_DIR}/skills/<skill-id>/<version-id>.zip`，备份数据目录时一起备份。
+
+飞书员工登录需要在飞书开放平台「安全设置 - 重定向 URL」中增加
+`https://<你的域名>/api/auth/feishu/callback`（或通过 `FEISHU_WEB_REDIRECT_URI` 指定），
+并确保应用已开启网页能力。配置后登录页会出现「使用飞书登录」。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/auth/me` | 当前登录身份与是否启用飞书登录 |
+| GET | `/api/auth/feishu/start` | 跳转飞书网页授权 |
+| GET | `/api/auth/feishu/callback` | 飞书回调，设置员工会话 |
+| GET | `/api/skills` | 列表 / 搜索 / 分类 / 分页 |
+| POST | `/api/skills?name=&version=&...` | 上传首版（raw zip / markdown body） |
+| GET | `/api/skills/:id` | 详情与版本历史 |
+| POST | `/api/skills/:id/versions` | 上传新版本 |
+| PATCH | `/api/skills/:id` | 编辑元数据；管理员可改状态 |
+| DELETE | `/api/skills/:id?confirm=<名称>` | 删除 Skill |
+| GET | `/api/skills/:id/download?version=` | 下载指定版本（默认最新） |
+
 ## 绑定、多工作区与一对一约束
 
 - **一个飞书人一个主 Agent**，主 Agent 同时只有一台机器在线（换机时新设备顶掉旧设备）。
@@ -289,7 +324,10 @@ sa stop
 | `conversations` | Agent + 飞书会话 + thread → 运行时 sessionRef（多轮续聊） |
 | `runs` | 任务级记录、租约、用量、最终结果 |
 | `steps` | 步骤级 trace，`(run_id, seq)` 唯一 |
-| `audit_logs` | 管理员操作审计 |
+| `skills` | Skill 聚合根：名称、简介、分类、标签、作者、状态、累计下载量 |
+| `skill_versions` | 每个版本一个 zip 包：版本号、大小、SHA-256、文件清单、SKILL.md 预览、下载量 |
+| `skill_downloads` | Skill 下载明细，用于审计与统计 |
+| `audit_logs` | 管理员与员工关键操作审计 |
 
 单文件部署的好处：备份 = 复制文件；迁移 = 启动时自动执行；500 个 Agent 的写压力（心跳 ≈ 20 次/秒）远低于 SQLite 单写者上限。
 
@@ -300,7 +338,7 @@ sa stop
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PORT` / `HOST` | `8787` / `0.0.0.0` | 监听地址 |
-| `DATA_DIR` | `./data` | SQLite 与日志目录（容器内 `/data`） |
+| `DATA_DIR` | `./data` | SQLite、日志与 Skill 包目录（容器内 `/data`） |
 | `ADMIN_PASSWORD` | 必填 | 管理后台口令（≥ 8 位） |
 | `ADMIN_SESSION_SECRET` | 派生 | 会话与绑定码签名密钥 |
 | `PUBLIC_BASE_URL` | 空 | 配置后绑定流程提供二维码 |
@@ -308,6 +346,7 @@ sa stop
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 必填 | 飞书自建应用凭证 |
 | `FEISHU_OPEN_BASE` | `https://open.feishu.cn` | Lark 国际版改成 `open.larksuite.com` |
 | `FEISHU_OAUTH_REDIRECT_URI` | 空 | 扫码一步绑定所需回调 |
+| `FEISHU_WEB_REDIRECT_URI` | 派生 | 员工飞书登录回调；不配则用 `${PUBLIC_BASE_URL}/api/auth/feishu/callback` |
 | `AGENT_TIMEOUT_SEC` | `1800` | 单次任务超时 |
 | `POLL_HOLD_MS` | `25000` | 长轮询挂起时长，需小于反向代理空闲超时 |
 | `RUN_LEASE_MS` | `120000` | 任务租约，超时回收重投 |
@@ -316,6 +355,9 @@ sa stop
 | `ENROLL_TTL_SEC` | `300` | 绑定码有效期 |
 | `TRACE_RETENTION_DAYS` | `7` | 步骤明细保留天数 |
 | `TRACE_MAX_SUMMARY_CHARS` | `2000` | 单条 trace 摘要上限 |
+| `SKILL_MAX_BYTES` | `20971520` | Skill 包最大压缩体积（20MB） |
+| `SKILL_MAX_EXTRACTED_BYTES` | `83886080` | Skill 包解压后最大总体积（80MB） |
+| `SKILL_MAX_FILES` | `800` | Skill 包内最大文件数 |
 | `LOG_LEVEL` | `info` | `info` / `warn` / `error` |
 
 网关侧可用 `STAFF_AGENT_HOME`（数据目录）、`STAFF_AGENT_PI_BIN` / `STAFF_AGENT_CLAUDE_BIN` / `STAFF_AGENT_CODEX_BIN`（可执行文件路径）、`STAFF_AGENT_*_ARGS`（追加启动参数）覆盖默认行为。
@@ -355,12 +397,12 @@ staff-agent-platform/
 │   ├── platform/            # 平台服务
 │   │   └── src/
 │   │       ├── db/          # SQLite 连接与迁移
-│   │       ├── domain/      # agents / devices / runs / steps / enroll
+│   │       ├── domain/      # agents / devices / runs / steps / enroll / skills
 │   │       ├── feishu/      # 长连接客户端、网页授权
-│   │       ├── http/        # bridge / admin / bind 路由
-│   │       ├── services/    # 绑定、派发、投递箱、结果通知
+│   │       ├── http/        # bridge / admin / auth / skills / bind 路由
+│   │       ├── services/    # 绑定、派发、投递箱、结果通知、Skill 存储、网页会话
 │   │       └── trace/       # 脱敏、统计
-│   └── web/                 # 管理后台（React + Vite）
+│   └── web/                 # 管理后台 + Skill 广场（React + Vite）
 ├── packages/
 │   ├── shared/              # 协议类型与 zod schema（前后端、网关共用）
 │   └── bridge/              # 员工侧 npm 包（CLI + 3 个 runtime adapter）
@@ -380,6 +422,7 @@ staff-agent-platform/
 - 群聊必须 `@机器人 + @人`；不做「按历史上次执行人」的隐式路由。
 - 同一 Agent 串行执行任务；多个任务按到达顺序排队（工作区只是目录，不与主 Agent 并行）。
 - 平台不代理模型调用，模型额度与凭证由员工本机 CLI 管理。
+- Skill 广场按登录身份共享，不做审批流与敏感信息扫描；上传前请自行确认包内没有密钥、凭证或内部敏感数据。
 
 ---
 
