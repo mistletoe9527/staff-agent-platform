@@ -1,350 +1,441 @@
+<div align="center">
+
 # staff-agent-platform
 
-公司内部的**个人 Agent 平台**：员工把自己电脑上的 `pi` / Claude Code / Codex 接到平台，用飞书下指令，平台统一看所有 Agent 的 trace。
+**Turn every employee's own `pi` / Claude Code / Codex into a manageable digital employee.**
+Tasks come in from Feishu, run locally on the employee's machine, and every step is traced in one place.
 
-私有化单租户部署（每家公司一套），数据不出公司；飞书走**长连接**，内网不需要公网回调地址。
+[**English**](README.md) | [简体中文](README.zh-CN.md)
+
+<sub>Node ≥ 24 · Fastify · SQLite · React · single-tenant · self-hosted</sub>
+
+</div>
+
+---
+
+## Contents
+
+- [Overview](#overview)
+- [Why not agents-bridge](#why-not-agents-bridge)
+- [Quick start (Docker)](#quick-start-docker)
+- [Feishu app setup](#feishu-app-setup)
+- [Employee side: connect your own agent](#employee-side-connect-your-own-agent)
+- [Using it in Feishu](#using-it-in-feishu)
+- [Binding, workspaces, and one-to-one constraints](#binding-workspaces-and-one-to-one-constraints)
+- [Tracing](#tracing)
+- [Protocol (bridge ↔ platform)](#protocol-bridge--platform)
+- [Data model (SQLite, single file)](#data-model-sqlite-single-file)
+- [Configuration](#configuration)
+- [Operations](#operations)
+- [Repository layout](#repository-layout)
+- [Known limitations](#known-limitations)
+
+## Overview
+
+A company-internal **personal agent platform**. Employees connect the agent runtime already installed
+on their own laptop to the platform, dispatch work from Feishu, and administrators get a unified
+trace view over every agent in the company.
+
+Private, single-tenant deployment (one instance per company): data never leaves the company.
+Feishu runs over a **persistent WebSocket connection**, so no public callback URL is required on an
+intranet.
 
 ```
-飞书（公司自建应用 · 事件订阅走长连接）
-  │  私聊机器人 / 群里 @机器人 @某人
+Feishu (company self-built app · events over WebSocket)
+  │  direct message to the bot / @bot + @person in a group
   ▼
-platform（Node + Fastify + SQLite + React 后台）
-  │  ├─ 绑定：open_id ↔ agent_id ↔ 设备令牌（一对一）
-  │  ├─ 投递：长轮询 + 租约 + ack（不丢、不重、掉线可回收）
-  │  └─ trace：任务级 + 步骤级 + 聚合统计
-  ▲  POST /api/bridge/poll（长轮询，携带忙闲状态 + 主工作区目录）
-  │  POST /api/bridge/runs/:id/{ack,steps,report}（report 回传实际执行目录）
+platform (Node + Fastify + SQLite + React admin console)
+  │  ├─ binding:   open_id ↔ agent_id ↔ device token (one-to-one)
+  │  ├─ delivery:  long polling + lease + ack (no loss, no duplicates, offline recovery)
+  │  └─ trace:     run-level + step-level + aggregated stats
+  ▲  POST /api/bridge/poll (long poll, carries idle/busy state + primary workspace dir)
+  │  POST /api/bridge/runs/:id/{ack,steps,report} (report returns the actual cwd)
   │
-sa（员工电脑上的 npm 包，旧名 staff-agent）
-  └─ runtime adapter：pi --mode rpc / claude stream-json / codex exec --json
+sa (npm package on the employee machine, formerly staff-agent)
+  └─ runtime adapters: pi --mode rpc / claude stream-json / codex exec --json
 ```
 
-## 为什么不用 agents-bridge
+## Why not agents-bridge
 
-`agents-bridge` 是本地 CLI 网关，但它把运行时限定在 7 个内置后端（无 pi、不接受自定义命令）、没有自助注册、没有任何 trace 埋点，且绑定的是另一套 bot 数据模型。本项目复用了它的**协议形状**（长轮询 / ack / 状态上报），代码全部重写。
+`agents-bridge` is a local CLI gateway, but it hard-codes 7 built-in backends (no `pi`, no custom
+commands), has no self-service registration, no trace instrumentation at all, and binds to a
+different bot data model. This project reuses its **protocol shape** (long polling / ack / state
+reporting) and reimplements everything else.
 
-## 快速开始（Docker）
+## Quick start (Docker)
 
 ```bash
 git clone <repo> && cd staff-agent-platform
 cp .env.example .env
-# 必改：ADMIN_PASSWORD；必填：FEISHU_APP_ID / FEISHU_APP_SECRET
+# required: ADMIN_PASSWORD, FEISHU_APP_ID, FEISHU_APP_SECRET
 vim .env
 
 docker compose up -d --build
 curl http://127.0.0.1:8787/api/health
 ```
 
-打开 `http://127.0.0.1:8787` 进入管理后台（口令 = `ADMIN_PASSWORD`）。
+Open `http://127.0.0.1:8787` for the admin console (password = `ADMIN_PASSWORD`).
 
-本地开发：
+Local development:
 
 ```bash
 pnpm install
-pnpm --filter @staff-agent/web build          # 后台静态资源
+pnpm --filter @staff-agent/web build          # admin console static assets
 FEISHU_ENABLED=false ADMIN_PASSWORD=dev-password DATA_DIR=./data \
-  pnpm --filter @staff-agent/platform dev     # 平台 :8787
-pnpm --filter @staff-agent/web dev            # 后台 :5173（/api 代理到 8787）
+  pnpm --filter @staff-agent/platform dev     # platform :8787
+pnpm --filter @staff-agent/web dev            # admin console :5173 (/api proxied to 8787)
 ```
 
-> 本地开发前先停掉 docker 里的同名服务，否则 8787 被占用会报 `EADDRINUSE`：
-> `docker compose stop platform`（要恢复容器就 `docker compose start platform`）。
-> 换端口启动时需要同时改 `apps/web/vite.config.ts` 的代理目标，例如 `PORT=8788 pnpm ... dev` + 代理指向 `:8788`。
+> Stop the Docker service before running locally, otherwise port 8787 is taken and you get
+> `EADDRINUSE`: `docker compose stop platform` (restore with `docker compose start platform`).
+> If you change the port, also update the proxy target in `apps/web/vite.config.ts`
+> (e.g. `PORT=8788 pnpm ... dev` with the proxy pointing at `:8788`).
 
-## 飞书应用配置
+## Feishu app setup
 
-在[飞书开放平台](https://open.feishu.cn/app)创建**企业自建应用**：
+Create a **company self-built app** on the [Feishu Open Platform](https://open.feishu.cn/app):
 
-| 项 | 配置 |
+| Item | Setting |
 |---|---|
-| 机器人能力 | 开启 |
-| 权限 | `im:message`（接收消息）、`im:message:send_as_bot`（发消息）、`contact:contact.base:readonly`（可选，用于显示姓名） |
-| 事件订阅 | 模式选**长连接**，订阅 `im.message.receive_v1` |
-| 发布 | 创建版本并发布，可用范围选需要使用的员工 |
-| 群聊 | 把机器人拉进目标群 |
+| Bot capability | Enabled |
+| Permissions | `im:message` (receive), `im:message:send_as_bot` (send), `contact:contact.base:readonly` (optional, for display names) |
+| Event subscription | Mode = **WebSocket long connection**, subscribe `im.message.receive_v1` |
+| Release | Create a version and publish; set availability to the employees who need it |
+| Group chat | Add the bot to the target groups |
 
-扫码绑定（可选，需要手机能访问平台地址）：
+QR-code binding (optional; requires the phone to reach the platform URL):
 
-| 项 | 配置 |
+| Item | Setting |
 |---|---|
-| 通讯录权限（推荐） | `contact:contact.base:readonly` — 绑定时同步飞书**姓名 + 头像**，后台能认出是谁的数字员工；不开也能用，只是显示 `agent-xxxx` 和首字母占位头像 |
-| 网页应用能力 | 开启 |
-| 安全设置 → 重定向 URL | `https://<你的域名>/bind/callback` |
-| 环境变量 | `PUBLIC_BASE_URL=https://<你的域名>`、`FEISHU_OAUTH_REDIRECT_URI=https://<你的域名>/bind/callback` |
+| Contact permission (recommended) | `contact:contact.base:readonly` — syncs Feishu **name + avatar** on binding, so the console shows who the digital employee is; without it you still get `agent-xxxx` with an initial-letter avatar |
+| Web app capability | Enabled |
+| Security → Redirect URL | `https://<your-domain>/bind/callback` |
+| Environment | `PUBLIC_BASE_URL=https://<your-domain>`, `FEISHU_OAUTH_REDIRECT_URI=https://<your-domain>/bind/callback` |
 
-不配这两项时，二维码页面只展示绑定码，员工把码发到飞书即可，功能不受影响。
+Without these two settings the QR page only shows the binding code — the employee sends it to the
+bot in Feishu and everything still works.
 
-已绑定的人补开通讯录权限后，不用重登：管理后台 Agent 列表点「同步身份」即可拉取姓名与头像
-（`POST /api/admin/agents/:id/sync-profile`）。
+Users already bound can enable the contact permission later without re-login: click
+**Sync profile** in the console agent list (`POST /api/admin/agents/:id/sync-profile`).
 
-> 平台服务端用 `tenant_access_token`（应用身份）调通讯录，所以要开的是 `contact:contact.base:readonly`，
-> 不是同名易混的 `contact:user.base:readonly`（那是用户身份权限，开了也拿不到数据）。
+> The server calls the directory with `tenant_access_token` (app identity), so the permission needed
+> is `contact:contact.base:readonly` — not the similarly named `contact:user.base:readonly`
+> (user identity, which returns nothing here).
 
-### 排查：同步身份失败
+### Troubleshooting: profile sync fails
 
-「同步身份」失败时，后台提示里会带飞书原始错误码，对照处理：
+Failures surface the original Feishu error code in the console:
 
-| 飞书返回 | 原因 | 处理 |
+| Feishu error | Cause | Fix |
 |---|---|---|
-| `99991672` 权限不足 | 没开通 `contact:contact.base:readonly`，或开了没发布版本 | 开放平台「权限管理」添加该权限（应用身份）→ 创建版本并发布 → 企业管理员审核通过 |
-| `41050` no user authority | 权限有了，但该员工不在应用的通讯录**数据权限**范围内 | 开放平台「权限管理 → 数据权限」把可见范围设为全员或包含该员工，再发布版本 |
-| `99991663` token 无效 | 凭证与域名不匹配，或改了凭证没重启 | 检查 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_OPEN_BASE`（国内 `open.feishu.cn`，国际 `open.larksuite.com`），重启服务 |
+| `99991672` permission denied | `contact:contact.base:readonly` not granted, or granted but no release published | Add the permission (app identity) → create and publish a version → tenant admin approves |
+| `41050` no user authority | Permission granted, but the employee is outside the app's **data scope** | Set the visible range in *Permissions → Data scope* to all staff or to include that employee, then publish |
+| `99991663` invalid token | Credentials do not match the domain, or changed without restart | Check `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_OPEN_BASE` (`open.feishu.cn` domestic, `open.larksuite.com` international), restart |
 
-改完权限记得**发布版本并等审核通过**：只勾权限不发版，`tenant_access_token` 拿到的 scope 不会更新。
+After changing permissions, **publish a version and wait for approval**: granting scopes without a
+release does not update the scopes returned by `tenant_access_token`.
 
-### 排查：飞书里发了绑定码没反应
+### Troubleshooting: binding code sent in Feishu does nothing
 
-平台日志里搜 `收到飞书消息`：
+Search the platform logs for `收到飞书消息`:
 
-- **搜得到**：说明飞书事件已经到了平台，问题在绑定码本身（位数、是否过期、是否已被用掉），看紧邻的 `收到绑定码消息` 与绑定失败日志。
-- **搜不到**（终端一直停在 `等待绑定中…`）则是飞书后台配置没生效，按顺序核对：
-  1. 事件与回调 → 订阅方式 = **使用长连接接收事件**（配了 Webhook 地址时事件会走 Webhook，长连接收不到）。
-  2. 已订阅事件 `im.message.receive_v1`（接收消息）。
-  3. 权限已开通：`im:message`、`im:message.p2p_msg:readonly`（单聊）、`im:message.group_at_msg:readonly`（群里 @机器人）、`im:message:send_as_bot`。
-  4. **改完配置必须创建版本并发布**，且机器人可用范围包含你自己。
-  5. 同一个应用凭证不要在多处跑（长连接多实例会抢事件），本机先 `docker compose ps` 确认只有一份。
+- **Found**: events reach the platform; the problem is the code itself (length, expired, already
+  used). Check the adjacent `收到绑定码消息` and binding-failure logs.
+- **Not found** (the terminal stays on `等待绑定中…`): the Feishu console config is not in effect.
+  Verify in this order:
+  1. *Events & Callbacks* → subscription mode = **Receive events over long connection**
+     (a configured Webhook makes events go there instead).
+  2. `im.message.receive_v1` (receive message) is subscribed.
+  3. Permissions granted: `im:message`, `im:message.p2p_msg:readonly` (direct messages),
+     `im:message.group_at_msg:readonly` (group @bot), `im:message:send_as_bot`.
+  4. **Create a version and publish** after any config change, and the bot's availability includes you.
+  5. The same app credentials are not running in multiple places (multiple long-connection
+     instances compete for events) — check `docker compose ps` locally.
 
-平台侧自检：`curl -s localhost:8787/api/health` 里的 `feishu` 必须是 `connected`。
+Platform self-check: the `feishu` field in `curl -s localhost:8787/api/health` must be `connected`.
 
-## 员工侧：接入自己的 Agent
+## Employee side: connect your own agent
 
-> `@staff-agent/bridge` 是仓库内的私有 workspace 包，**没有发布到 npm 公共源**，
-> `npm install -g @staff-agent/bridge` 会直接 404。请按下面两种方式之一安装（Node >= 22.5）。
+> `@staff-agent/bridge` is a private workspace package in this repo and is **not published to the
+> public npm registry** — `npm install -g @staff-agent/bridge` returns 404. Install it one of the two
+> ways below (Node ≥ 22.5).
 
-**A. 本仓库开发机自用（推荐）**
+**A. From this repo (recommended for developers)**
 
 ```bash
 pnpm install
 pnpm bridge:link        # = build + npm install -g ./packages/bridge
 ```
 
-`npm install -g ./packages/bridge` 会做软链，源码目录重建后（`pnpm bridge:build`）全局命令自动生效，无需重装。
+`npm install -g ./packages/bridge` creates a symlink, so rebuilding the source
+(`pnpm bridge:build`) updates the global command without reinstalling.
 
-命令简写为 **`sa`**，旧名 `staff-agent` 作为别名保留（两套都指向同一个入口，老脚本不用改）。
+The command is shortened to **`sa`**, with `staff-agent` kept as an alias (both point at the same
+entry, existing scripts keep working).
 
-> ⚠️ macOS 自带 `/usr/sbin/sa`（系统记账工具），而默认 PATH 里 `/usr/sbin` 排在 `/opt/homebrew/bin` 前面，
-> 所以直接敲 `sa login` 会变成 `sa: open login read-only: No such file or directory`。三种解法（选一）：
+> ⚠️ macOS ships `/usr/sbin/sa` (the accounting tool), and `/usr/sbin` precedes `/opt/homebrew/bin`
+> in the default PATH, so `sa login` fails with
+> `sa: open login read-only: No such file or directory`. Pick one of three fixes:
 >
-> 1. 交互式用别名（推荐，只影响自己的 shell）：
+> 1. Interactive alias (recommended, shell-local):
 >    ```bash
 >    echo "alias sa='staff-agent'" >> ~/.zshrc && exec zsh
 >    ```
-> 2. 全局搞定：`sudo ln -sf "$(which staff-agent)" /usr/local/bin/sa`
->    （`/usr/local/bin` 在 PATH 里排第一，一次就永久生效，脚本里也能用）
-> 3. 不改环境：直接用长名 `staff-agent login ...`（两个名字指向同一入口）
+> 2. Global fix: `sudo ln -sf "$(which staff-agent)" /usr/local/bin/sa`
+>    (`/usr/local/bin` comes first in PATH, works in scripts too)
+> 3. Change nothing: use the long name `staff-agent login ...` (same entry point)
 
-**B. 打包给同事安装（tgz 分发）**
+**B. Package for colleagues (tgz distribution)**
 
 ```bash
-pnpm bridge:pack                      # 产物：.pack/staff-agent-bridge-<version>.tgz
-# 把 tgz 发给同事，对方执行：
+pnpm bridge:pack                      # output: .pack/staff-agent-bridge-<version>.tgz
+# send the tgz to a colleague, who runs:
 npm install -g ./staff-agent-bridge-<version>.tgz
 ```
 
-> 需要像公共包一样 `npm i -g @staff-agent/bridge` 分发时，得发布到私有 registry
-> （Verdaccio / npmjs 私有 scope / GitHub Packages），并把 `private` 改为 `false`、补上 `publishConfig`。
+> To distribute it like a public package (`npm i -g @staff-agent/bridge`), publish to a private
+> registry (Verdaccio / private scope on npmjs / GitHub Packages), set `private` to `false` and add
+> `publishConfig`.
 
 ```bash
-# 1. 登录：选择本机已有的运行时
-sa login --platform http://<平台地址>:8787 --runtime pi
+# 1. Log in: pick a runtime already installed on this machine
+sa login --platform http://<platform-host>:8787 --runtime pi
 
-#    终端会显示 6 位绑定码；在飞书里把码发给机器人（或手机扫码）
-#    绑定成功后自动生成主工作区 ~/staff-agent-workspaces/<Agent 名>（可用 --cwd 指定，
-#    或用 STAFF_AGENT_WORKSPACES 换根目录），凭据写入 ~/.staff-agent/config.json（0600）
+#    The terminal shows a 6-digit binding code; send it to the bot in Feishu (or scan the QR code).
+#    On success the primary workspace ~/staff-agent-workspaces/<agent-name> is created
+#    (override with --cwd, or move the root with STAFF_AGENT_WORKSPACES); credentials are written
+#    to ~/.staff-agent/config.json (0600).
 
-# 2. 后台常驻
+# 2. Run in the background
 sa start --daemon
 
-# 3. 可选：新增工作区（= 一个工作目录 + 职责边界），只存本机配置，平台看不到
-sa agents add --name 前端 --cwd ~/work/web
-#    不写 --description 时，本机运行时会先读一遍目录，自动总结这个工作区负责什么
-sa agents list        # 主工作区 + 自定义工作区、目录、职责
-sa agents update 前端 --ai-description   # 目录变了，重新生成职责说明
-sa agents remove 前端                    # 删除工作区（只删本机配置，工作目录保留）
+# 3. Optional: add workspaces (= a working directory + a scope of responsibility), local-only
+sa agents add --name frontend --cwd ~/work/web
+#    Without --description, the local runtime reads the directory first and summarizes what it owns
+sa agents list        # primary workspace + custom workspaces, directories, responsibilities
+sa agents update frontend --ai-description   # directory changed, regenerate the description
+sa agents remove frontend                    # delete the workspace (local config only, files kept)
 
-# 其他
-sa status     # 登录状态、运行时版本、进程
-sa doctor     # 检查 pi / claude / codex 与平台连通性
-sa logs       # 查看日志文件路径（~/.staff-agent/logs/bridge.log）
+# Other commands
+sa status     # login state, runtime version, process
+sa doctor     # check pi / claude / codex and platform connectivity
+sa logs       # path to the log file (~/.staff-agent/logs/bridge.log)
 sa stop
 ```
 
-三种运行时的事件能力：
+Event fidelity per runtime:
 
-| 运行时 | 驱动方式 | trace 完整度 |
+| Runtime | Driver | Trace completeness |
 |---|---|---|
-| `pi` | `pi --mode rpc`（长驻 JSONL） | 最完整：工具入参/出参、耗时、token、settled |
-| `claude` | `claude -p --output-format stream-json` | 工具调用、文本、token（`result.usage`） |
-| `codex` | `codex exec --json` | 命令执行、文件变更、MCP 调用、token |
+| `pi` | `pi --mode rpc` (long-lived JSONL) | Best: tool inputs/outputs, durations, tokens, settled |
+| `claude` | `claude -p --output-format stream-json` | Tool calls, text, tokens (`result.usage`) |
+| `codex` | `codex exec --json` | Command execution, file changes, MCP calls, tokens |
 
-模型凭证始终在员工本机（各 CLI 自己的登录态），平台不代理模型调用、不保存模型 Key。
+Model credentials always stay on the employee's machine (each CLI keeps its own login). The platform
+never proxies model calls and never stores model keys.
 
-## 在飞书里怎么用
+## Using it in Feishu
 
-| 场景 | 用法 |
+| Scenario | How |
 |---|---|
-| 私聊机器人 | 直接发指令，执行者是机器人主人自己的主 Agent |
-| 群聊 | `@机器人 @张三 帮我看下这个报错`，任务投给**张三**的 Agent |
-| 只 @机器人 不 @人 | 平台回复提示，要求补充执行人（不猜默认值） |
-| 目标人没绑 Agent | 平台回复提示对方先运行 `sa login` |
-| 目标设备离线 | 任务照常入队，回复里说明「联网后自动执行」 |
-| Agent 正在执行 | 任务排队，回复里说明前面还有几个 |
-| 有工作区 | 执行者仍是主 Agent：网关把本机工作区的职责边界与目录写进提示词，由它判断进哪个目录干活 |
-| 任务里提到工作区名 | 名字命中（例：工作区「健康管理+商城」+ 问题「健康管理有哪些功能」）时，提示词会直接指明去那个目录，不靠模型猜 |
-| 指定工作区 | `#前端 帮我把登录页改成新设计`，直接在该工作区目录执行（`#名字` 由本机解析） |
-| 查看工作区 | `#列表` 由本机直接回复（不花模型 token），列出主工作区 + 工作区、目录与职责 |
+| Direct message to the bot | Just send the instruction; executed by the bot owner's own primary agent |
+| Group chat | `@bot @Alice please look at this error` — the task goes to **Alice's** agent |
+| Only `@bot`, no person | The platform replies asking for the executor (it never guesses a default) |
+| Target has no agent bound | The platform replies asking them to run `sa login` |
+| Target device offline | The task is queued anyway; the reply says it will run once back online |
+| Agent busy | The task is queued; the reply says how many are ahead |
+| Workspaces exist | The executor is still the primary agent: the gateway injects the local workspaces' responsibilities and directories into the prompt and lets it choose where to work |
+| Task mentions a workspace | On a name hit (e.g. workspace `health+mall` with the question "what features does health have"), the prompt names the directory instead of making the model guess |
+| Explicit workspace | `#frontend convert the login page to the new design` — runs in that directory (`#name` resolved locally) |
+| List workspaces | `#list` is answered locally (no model tokens), listing the primary + custom workspaces, directories and responsibilities |
 
-## 绑定、多工作区与一对一约束
+## Binding, workspaces, and one-to-one constraints
 
-- **一个飞书人一个主 Agent**，主 Agent 同时只有一台机器在线（换机时新设备顶掉旧设备）。
-- 工作区（以前的「子 Agent」）**只存在本机** `~/.staff-agent/config.json`，平台完全不知道有哪些：
-  目录是本机路径，放到平台上只会变成一份会过期的副本。多轮对话共用主 Agent 会话，上下文不因切换目录而断。
-- 平台只下发飞书原文；`#名字` / `#列表` 的解析、目录选择、提示词里的工作区清单都由网关在本地完成，
-  任务结束后网关把**实际执行目录**随结果回传，后台在任务详情里能看到。
-- 工作区描述留空时，客户端会让本机运行时真的去读目录，自动总结一句职责说明。
-- **增删改工作区立即生效**：网关按 `config.json` 的 mtime 自动重载，不用 `sa stop && start`
-  （以前网关只在启动时读一次配置，新加的工作区会让任务落到空的主工作区）。
-- **删除工作区**：`sa agents remove <名称>`，只删本机配置，机器上的目录原样保留。
-- **不向会话暴露本机信息**：提示词里明确要求只回结论，不提路径、家目录、工作区名称，也不描述「切目录/搜索/读了什么」；
-  目录里没材料时直接给通用答案，而不是说「工作区是空的」。`#列表` 是例外（会列出本机目录，建议只在私聊里用）。
-- **后台只有一个 Agent**：管理后台的 Agent 列表、Agent 总数、运行时分布都只按主 Agent 统计（`is_primary = 1`）。
-- 三个管理动作的区别：**禁用**（保留身份与设备，随时可恢复）/ **强制下线**（只撤销令牌，身份还在）/
-  **删除**（把这个人从平台移除，设备归属一起清空）。
-- **删除数字员工**：后台 Agent 列表「删除」（要求输入 Agent 名确认），或
-  `DELETE /api/admin/agents/:id?confirm=<Agent 名>`。会撤销设备令牌、清空会话与未用绑定码，
-  历史任务与 trace 保留（任务列表里显示「已删除的 Agent」）；那台机器重新 `sa login` 就能再绑。
-- 换电脑要重新 `sa agents add`（工作区是本机配置）；`login` 不会清空已有的工作区列表。
-- 绑定码 6 位、5 分钟有效、一次性；数据库只存 HMAC，泄露库也反推不出码。
-- 设备令牌只在绑定完成时下发一次，数据库只存 SHA-256；撤销后立即失效。
-- 员工换电脑：重新 `login`（新设备自动顶掉旧设备）；换人使用同一台机器：管理员先「强制下线」，再让对方登录。
+- **One Feishu person, one primary agent**, with exactly one machine online at a time (a new device
+  displaces the old one on re-login).
+- Workspaces (formerly "sub-agents") **exist only on the local machine** in
+  `~/.staff-agent/config.json`; the platform has no idea which ones exist. Directories are local
+  paths — uploading them would only produce a stale copy. Multi-turn conversations share the primary
+  agent session, so context survives directory switches.
+- The platform delivers only the raw Feishu text; `#name` / `#list` resolution, directory selection
+  and the workspace list in the prompt are all done locally by the gateway. After a task the gateway
+  reports the **actual working directory**, visible in the console's run detail.
+- When a workspace has no description, the client asks the local runtime to actually read the
+  directory and summarize its responsibility in one sentence.
+- **Workspace changes take effect immediately**: the gateway reloads on `config.json` mtime, no
+  `sa stop && start` needed (previously config was read once at startup, so a new workspace silently
+  fell back to the primary workspace).
+- **Removing a workspace**: `sa agents remove <name>` deletes local config only; the directory on
+  disk is untouched.
+- **No host details leak into the conversation**: the prompt requires conclusions only — no paths,
+  home directory, workspace names, and no narration of "switching directories / searching / reading
+  files". If the directory has no relevant material, answer generically rather than saying the
+  workspace is empty. `#list` is the exception (it lists local directories — prefer direct messages).
+- **The console shows exactly one agent per person**: agent list, agent count and runtime
+  distribution count only primary agents (`is_primary = 1`).
+- Three admin actions differ: **disable** (keeps identity and device, reversible) /
+  **force offline** (revokes the token only, identity stays) / **delete** (removes the person from
+  the platform and clears device ownership).
+- **Deleting a digital employee**: console agent list → *Delete* (requires typing the agent name), or
+  `DELETE /api/admin/agents/:id?confirm=<agent-name>`. It revokes device tokens and clears sessions
+  and unused binding codes; historical runs and traces are kept (listed as "deleted agent"). Running
+  `sa login` on that machine binds it again.
+- Changing computers requires `sa agents add` again (workspaces are local config); `login` does not
+  clear the existing workspace list.
+- Binding codes are 6 digits, valid for 5 minutes, single-use; the database stores only an HMAC, so a
+  leaked database cannot be reversed into codes.
+- Device tokens are issued once at binding time and stored as SHA-256; revocation takes effect
+  immediately.
+- New computer, same person: `login` again (the new device displaces the old one). New person, same
+  machine: the admin clicks *Force offline* first, then the person logs in.
 
-## trace
+## Tracing
 
-两级：
+Two levels:
 
-| 级别 | 内容 | 用途 |
+| Level | Content | Purpose |
 |---|---|---|
-| 任务级 `runs` | 谁在哪个会话发起、prompt、状态、耗时、token、最终结果、错误 | 管理员看统计与追责 |
-| 步骤级 `steps` | `llm` / `tool` / `message` / `thinking` / `error`，含工具名、入参出参摘要、耗时、token、是否报错 | 排查「它到底做了什么」 |
+| Run-level `runs` | who started it, in which conversation, prompt, status, duration, tokens, final result, error | statistics and accountability for admins |
+| Step-level `steps` | `llm` / `tool` / `message` / `thinking` / `error`, with tool name, input/output digests, duration, tokens, failure flag | find out what it actually did |
 
-- 入参出参先**脱敏再落库**：`sk-*`、`LTAI*`、`AKIA*`、Bearer、`password/token/secret=`、连接串密码、私钥块统一替换为 `***`。
-- 明细保留 `TRACE_RETENTION_DAYS` 天（默认 7），过期只删步骤明细，任务级记录与聚合统计保留。
-- 步骤以 `(run_id, seq)` 唯一约束幂等，网关重传不会产生重复。
+- Inputs and outputs are **redacted before storage**: `sk-*`, `LTAI*`, `AKIA*`, Bearer tokens,
+  `password/token/secret=`, connection-string passwords and private key blocks are all replaced
+  with `***`.
+- Step details are kept for `TRACE_RETENTION_DAYS` days (default 7); expiry deletes step details
+  only, run records and aggregates are kept.
+- Steps are idempotent via a unique `(run_id, seq)` constraint, so gateway retries never duplicate.
 
-## 协议（网关 ↔ 平台）
+## Protocol (bridge ↔ platform)
 
-全部由网关主动外连；平台不访问员工机器。
+Everything is outbound from the gateway; the platform never connects to employee machines.
 
-| 方法 | 路径 | 认证 | 说明 |
+| Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/bridge/register` | 无 | 登记设备，返回 6 位绑定码 |
-| POST | `/api/bridge/enroll/poll` | 无 | 轮询绑定结果，成功后一次性下发设备令牌 |
-| POST | `/api/bridge/poll` | Bearer | 长轮询接任务（默认挂起 25s），同时上报忙闲状态 + 主工作区目录/职责 |
-| POST | `/api/bridge/runs/:id/ack` | Bearer | 认领确认，刷新租约 |
-| POST | `/api/bridge/runs/:id/steps` | Bearer | 批量上报步骤（幂等） |
-| POST | `/api/bridge/runs/:id/report` | Bearer | 上报终态、结果、用量、运行时 session、实际执行目录 `cwd` |
-| GET | `/api/health` | 无 | 健康检查 |
+| POST | `/api/bridge/register` | — | Register a device, returns a 6-digit binding code |
+| POST | `/api/bridge/enroll/poll` | — | Poll for the binding result; the device token is issued once on success |
+| POST | `/api/bridge/poll` | Bearer | Long poll for tasks (default 25s hold) and report idle/busy state + primary workspace dir/responsibility |
+| POST | `/api/bridge/runs/:id/ack` | Bearer | Claim confirmation, renews the lease |
+| POST | `/api/bridge/runs/:id/steps` | Bearer | Batch step upload (idempotent) |
+| POST | `/api/bridge/runs/:id/report` | Bearer | Terminal state, result, usage, runtime session, actual cwd |
+| GET | `/api/health` | — | Health check |
 
-**没有独立心跳接口**：长轮询本身就是心跳。`poll` 请求体携带 `state`（idle/busy）与 `activeRuns`，平台据此判断在线与忙闲，少一条链路就少一处状态不一致。
+**There is no separate heartbeat endpoint**: long polling is the heartbeat. The `poll` body carries
+`state` (idle/busy) and `activeRuns`, from which the platform derives liveness and load — one less
+link, one less place for state to drift.
 
-## 数据模型（SQLite，单文件）
+## Data model (SQLite, single file)
 
-| 表 | 说明 |
+| Table | Description |
 |---|---|
-| `agents` | 飞书人 ↔ Agent：平台只存主 Agent（`is_primary = 1`），`cwd`/`description` 由网关心跳上报；工作区在员工本机 |
-| `devices` | 设备、机器指纹、令牌哈希、最近心跳、忙闲状态 |
-| `enroll_codes` | 绑定码哈希、过期时间、一次性 token 中转列 |
-| `conversations` | Agent + 飞书会话 + thread → 运行时 sessionRef（多轮续聊） |
-| `runs` | 任务级记录、租约、用量、最终结果 |
-| `steps` | 步骤级 trace，`(run_id, seq)` 唯一 |
-| `audit_logs` | 管理员操作审计 |
+| `agents` | Feishu person ↔ agent: only primary agents are stored (`is_primary = 1`); `cwd`/`description` come from the gateway heartbeat; workspaces live on the employee machine |
+| `devices` | Device, machine fingerprint, token hash, last heartbeat, idle/busy state |
+| `enroll_codes` | Binding code hash, expiry, single-use token transfer column |
+| `conversations` | Agent + Feishu conversation + thread → runtime sessionRef (multi-turn continuation) |
+| `runs` | Run record, lease, usage, final result |
+| `steps` | Step-level trace, unique `(run_id, seq)` |
+| `audit_logs` | Admin action audit |
 
-单文件部署的好处：备份 = 复制文件；迁移 = 启动时自动执行；500 个 Agent 的写压力（心跳 ≈ 20 次/秒）远低于 SQLite 单写者上限。
+Why one file: backup = copy the file; migration = runs at startup; write pressure for 500 agents
+(heartbeat ≈ 20 writes/s) is far below what a single-writer SQLite can handle.
 
-## 配置
+## Configuration
 
-所有配置走环境变量，仓库里没有任何凭证。
+All configuration is via environment variables; no credentials live in the repo.
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `PORT` / `HOST` | `8787` / `0.0.0.0` | 监听地址 |
-| `DATA_DIR` | `./data` | SQLite 与日志目录（容器内 `/data`） |
-| `ADMIN_PASSWORD` | 必填 | 管理后台口令（≥ 8 位） |
-| `ADMIN_SESSION_SECRET` | 派生 | 会话与绑定码签名密钥 |
-| `PUBLIC_BASE_URL` | 空 | 配置后绑定流程提供二维码 |
-| `FEISHU_ENABLED` | `true` | 关闭后平台仍可启动（本地联调） |
-| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 必填 | 飞书自建应用凭证 |
-| `FEISHU_OPEN_BASE` | `https://open.feishu.cn` | Lark 国际版改成 `open.larksuite.com` |
-| `FEISHU_OAUTH_REDIRECT_URI` | 空 | 扫码一步绑定所需回调 |
-| `AGENT_TIMEOUT_SEC` | `1800` | 单次任务超时 |
-| `POLL_HOLD_MS` | `25000` | 长轮询挂起时长，需小于反向代理空闲超时 |
-| `RUN_LEASE_MS` | `120000` | 任务租约，超时回收重投 |
-| `RUN_MAX_ATTEMPTS` | `3` | 最大重投次数 |
-| `ONLINE_WINDOW_SEC` | `60` | 在线判定窗口 |
-| `ENROLL_TTL_SEC` | `300` | 绑定码有效期 |
-| `TRACE_RETENTION_DAYS` | `7` | 步骤明细保留天数 |
-| `TRACE_MAX_SUMMARY_CHARS` | `2000` | 单条 trace 摘要上限 |
+| `PORT` / `HOST` | `8787` / `0.0.0.0` | Listen address |
+| `DATA_DIR` | `./data` | SQLite and log directory (`/data` in the container) |
+| `ADMIN_PASSWORD` | required | Admin console password (≥ 8 chars) |
+| `ADMIN_SESSION_SECRET` | derived | Session and binding-code signing secret |
+| `PUBLIC_BASE_URL` | empty | Enables the QR-code binding flow |
+| `FEISHU_ENABLED` | `true` | Set to false to boot without Feishu (local integration) |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | required | Feishu self-built app credentials |
+| `FEISHU_OPEN_BASE` | `https://open.feishu.cn` | Use `open.larksuite.com` for Lark international |
+| `FEISHU_OAUTH_REDIRECT_URI` | empty | Callback for one-step QR binding |
+| `AGENT_TIMEOUT_SEC` | `1800` | Per-task timeout |
+| `POLL_HOLD_MS` | `25000` | Long-poll hold time, must be below the reverse proxy idle timeout |
+| `RUN_LEASE_MS` | `120000` | Task lease; expired leases are requeued |
+| `RUN_MAX_ATTEMPTS` | `3` | Maximum re-deliveries |
+| `ONLINE_WINDOW_SEC` | `60` | Liveness window |
+| `ENROLL_TTL_SEC` | `300` | Binding code TTL |
+| `TRACE_RETENTION_DAYS` | `7` | Step detail retention |
+| `TRACE_MAX_SUMMARY_CHARS` | `2000` | Max characters per trace summary |
 | `LOG_LEVEL` | `info` | `info` / `warn` / `error` |
 
-网关侧可用 `STAFF_AGENT_HOME`（数据目录）、`STAFF_AGENT_PI_BIN` / `STAFF_AGENT_CLAUDE_BIN` / `STAFF_AGENT_CODEX_BIN`（可执行文件路径）、`STAFF_AGENT_*_ARGS`（追加启动参数）覆盖默认行为。
+On the gateway side: `STAFF_AGENT_HOME` (data directory),
+`STAFF_AGENT_PI_BIN` / `STAFF_AGENT_CLAUDE_BIN` / `STAFF_AGENT_CODEX_BIN` (executable paths),
+`STAFF_AGENT_*_ARGS` (extra launch arguments).
 
-## 运维
+## Operations
 
 ```bash
-# 日志
+# Logs
 docker logs -f staff-agent-platform
 
-# 备份（WAL 模式，推荐用 SQLite 在线备份，保证一致性）
+# Backup (WAL mode: use SQLite online backup for consistency)
 docker compose exec platform node -e "
 const {DatabaseSync}=require('node:sqlite');
 new DatabaseSync('/data/staff-agent.db').exec(\"VACUUM INTO '/data/backup.db'\")"
 
-# 升级
+# Upgrade
 git pull && docker compose up -d --build
 
-# 迁移（启动时自动执行，也可单独跑）
+# Migrations (automatic at startup, also runnable standalone)
 docker compose exec platform pnpm --filter @staff-agent/platform migrate
 ```
 
-排障顺序：
+Troubleshooting order:
 
-1. `GET /api/health` 看平台与飞书连接状态；
-2. 管理后台看 Agent 是否在线（最近心跳 < 60s）；
-3. 员工机器跑 `sa doctor`；
-4. 看 `~/.staff-agent/logs/bridge.log` 与平台 `docker logs`；
-5. 任务卡住看 `runs.lease_expires_at`：租约过期会自动回到队列。
-6. 任务直接失败且报 `spawn xxx ENOENT`：要么运行时 CLI 不在 PATH（后台进程常由 launchd 拉起，PATH 很精简，网关会额外搜索 `~/.pi/agent/bin`、`~/.local/bin`、`/opt/homebrew/bin` 等目录），要么配置里的任务工作目录不存在（网关会按 `mkdir -p` 自动补建，补建失败才会失败任务）。
+1. `GET /api/health` for platform and Feishu connection state;
+2. console: is the agent online (last heartbeat < 60s)?
+3. on the employee machine, run `sa doctor`;
+4. read `~/.staff-agent/logs/bridge.log` and `docker logs`;
+5. stuck task: check `runs.lease_expires_at` — expired leases return to the queue automatically.
+6. task fails immediately with `spawn xxx ENOENT`: either the runtime CLI is not on PATH
+   (background daemons started by launchd get a minimal PATH; the gateway additionally searches
+   `~/.pi/agent/bin`, `~/.local/bin`, `/opt/homebrew/bin`, …), or the configured working directory
+   does not exist (the gateway auto-creates it with `mkdir -p`; the task only fails if that fails).
 
-## 目录结构
+## Repository layout
 
 ```
 staff-agent-platform/
 ├── apps/
-│   ├── platform/            # 平台服务
+│   ├── platform/            # platform service
 │   │   └── src/
-│   │       ├── db/          # SQLite 连接与迁移
+│   │       ├── db/          # SQLite connection and migrations
 │   │       ├── domain/      # agents / devices / runs / steps / enroll
-│   │       ├── feishu/      # 长连接客户端、网页授权
-│   │       ├── http/        # bridge / admin / bind 路由
-│   │       ├── services/    # 绑定、派发、投递箱、结果通知
-│   │       └── trace/       # 脱敏、统计
-│   └── web/                 # 管理后台（React + Vite）
+│   │       ├── feishu/      # WebSocket client, web authorization
+│   │       ├── http/        # bridge / admin / bind routes
+│   │       ├── services/    # binding, dispatch, outbox, result notification
+│   │       └── trace/       # redaction, statistics
+│   └── web/                 # admin console (React + Vite)
 ├── packages/
-│   ├── shared/              # 协议类型与 zod schema（前后端、网关共用）
-│   └── bridge/              # 员工侧 npm 包（CLI + 3 个 runtime adapter）
+│   ├── shared/              # protocol types and zod schemas (server, web, gateway)
+│   └── bridge/              # employee-side npm package (CLI + 3 runtime adapters)
 │       └── src/
-│           ├── routing.ts   # 本机工作区路由：#名字 / #列表 / 提示词组装
-│           ├── agents.ts    # 工作区 CRUD（只写本机 config.json）
-│           └── runner.ts    # 任务执行 + trace 上报（含实际执行目录）
+│           ├── routing.ts   # local workspace routing: #name / #list / prompt assembly
+│           ├── agents.ts    # workspace CRUD (writes only the local config.json)
+│           └── runner.ts    # task execution + trace upload (incl. actual cwd)
 ├── docker-compose.yml
 ├── Dockerfile
 └── .env.example
 ```
 
-## 已知限制
+## Known limitations
 
-- 飞书长连接同一应用只能有一个实例在线，多实例需要改成 HTTP 事件订阅。
-- 只处理文本消息；图片、文件、语音暂不转发给 Agent。
-- 群聊必须 `@机器人 + @人`；不做「按历史上次执行人」的隐式路由。
-- 同一 Agent 串行执行任务；多个任务按到达顺序排队（工作区只是目录，不与主 Agent 并行）。
-- 平台不代理模型调用，模型额度与凭证由员工本机 CLI 管理。
+- A Feishu long connection allows only one instance per app; multiple instances require switching to
+  HTTP event subscription.
+- Text messages only; images, files and voice are not forwarded to the agent yet.
+- Group chats require `@bot + @person`; there is no implicit routing to "whoever ran it last".
+- Tasks for one agent run serially, queued in arrival order (workspaces are directories, not parallel
+  to the primary agent).
+- The platform does not proxy model calls; model quota and credentials are managed by each employee's
+  local CLI.
+
+---
+
+<div align="center">
+<sub>Release history: <a href="CHANGELOG.md">CHANGELOG.md</a> · Questions? Open an issue.</sub>
+</div>
