@@ -12,8 +12,10 @@ import { purgeEnrollCodes } from './domain/enroll.js';
 import { FeishuClient, NoopFeishuClient, type FeishuPort } from './feishu/client.js';
 import { FeishuOAuth } from './feishu/oauth.js';
 import { registerAdminRoutes } from './http/routes-admin.js';
+import { registerAuthRoutes } from './http/routes-auth.js';
 import { registerBindRoutes } from './http/routes-bind.js';
 import { registerBridgeRoutes } from './http/routes-bridge.js';
+import { registerSkillRoutes } from './http/routes-skills.js';
 import { DispatchService } from './services/dispatch-service.js';
 import { EnrollService } from './services/enroll-service.js';
 import { Inbox } from './services/inbox.js';
@@ -66,6 +68,21 @@ async function main(): Promise<void> {
   });
   await app.register(cookie, { secret: config.sessionSecret });
 
+  // Skill 包上传走 raw body：浏览器端把文件夹 / Markdown 打包成 zip 后直接 POST。
+  for (const contentType of [
+    'application/zip',
+    'application/x-zip-compressed',
+    'application/octet-stream',
+    'text/markdown',
+    'text/plain',
+  ]) {
+    app.addContentTypeParser(
+      contentType,
+      { parseAs: 'buffer', bodyLimit: config.SKILL_MAX_BYTES + 4096 },
+      (_request, body, done) => done(null, body),
+    );
+  }
+
   const webRoot = fileURLToPath(new URL('../../web/dist', import.meta.url));
   if (existsSync(webRoot)) {
     await app.register(fastifyStatic, { root: webRoot, prefix: '/', index: ['index.html'] });
@@ -79,6 +96,8 @@ async function main(): Promise<void> {
 
   registerBridgeRoutes(app, { db, config, inbox, enroll, notifier, logger });
   registerAdminRoutes(app, { db, config, feishu, logger });
+  registerAuthRoutes(app, { db, config, oauth, logger });
+  registerSkillRoutes(app, { db, config, logger });
   registerBindRoutes(app, { config, enroll, oauth, logger });
 
   // 前端单页应用回退；/api 下的 404 保持 JSON
