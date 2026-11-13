@@ -41,6 +41,13 @@ const EnvSchema = z.object({
    */
   FEISHU_OAUTH_REDIRECT_URI: emptyAsUndefined(z.string().url()),
 
+  /**
+   * 员工登录 Skill 广场的飞书网页授权回调地址。
+   * 不配置时自动使用 `${PUBLIC_BASE_URL}/api/auth/feishu/callback`；
+   * 需要与飞书后台「安全设置 - 重定向 URL」保持一致。
+   */
+  FEISHU_WEB_REDIRECT_URI: emptyAsUndefined(z.string().url()),
+
   /** 管理后台登录口令 */
   ADMIN_PASSWORD: z.string().min(8),
   /** 管理后台 Cookie 签名密钥，留空则用 ADMIN_PASSWORD 派生 */
@@ -62,6 +69,13 @@ const EnvSchema = z.object({
   /** 单条 trace 摘要最大字符数 */
   TRACE_MAX_SUMMARY_CHARS: z.coerce.number().int().positive().default(2000),
 
+  /** Skill 包最大压缩体积（字节），默认 20MB */
+  SKILL_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
+  /** Skill 包解压后的最大总体积（字节），防压缩炸弹 */
+  SKILL_MAX_EXTRACTED_BYTES: z.coerce.number().int().positive().default(80 * 1024 * 1024),
+  /** Skill 包内最大文件数 */
+  SKILL_MAX_FILES: z.coerce.number().int().positive().default(800),
+
   /** 绑定码有效期（秒） */
   ENROLL_TTL_SEC: z.coerce.number().int().positive().default(300),
   /** 日志级别，只允许 info / warn / error */
@@ -75,6 +89,10 @@ export type Config = z.infer<typeof EnvSchema> & {
   feishuReady: boolean;
   /** 是否启用扫码绑定（需要公网可达地址 + 网页授权回调） */
   oauthReady: boolean;
+  /** 员工登录 Skill 广场的飞书回调地址；为空表示不启用员工飞书登录 */
+  webRedirectUri: string | null;
+  /** 是否启用员工飞书登录 */
+  webLoginReady: boolean;
 };
 
 /**
@@ -94,10 +112,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (value.FEISHU_ENABLED && !feishuReady) {
     throw new Error('FEISHU_ENABLED=true 时必须同时配置 FEISHU_APP_ID 与 FEISHU_APP_SECRET');
   }
+  const publicBase = value.PUBLIC_BASE_URL?.replace(/\/$/, '') ?? null;
+  const webRedirectUri =
+    value.FEISHU_WEB_REDIRECT_URI ?? (publicBase ? `${publicBase}/api/auth/feishu/callback` : null);
   return {
     ...value,
     sessionSecret: value.ADMIN_SESSION_SECRET ?? `staff-agent:${value.ADMIN_PASSWORD}`,
     feishuReady,
     oauthReady: feishuReady && Boolean(value.PUBLIC_BASE_URL) && Boolean(value.FEISHU_OAUTH_REDIRECT_URI),
+    webRedirectUri,
+    webLoginReady: feishuReady && Boolean(webRedirectUri),
   };
 }

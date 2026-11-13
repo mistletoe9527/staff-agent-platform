@@ -4,7 +4,9 @@ import { extractText, readNumber, summarize } from './types.js';
 import {
   bindAbort,
   cliEnv,
+  describeCheckFailure,
   describeSpawnFailure,
+  needsShell,
   planSpawn,
   readChildJsonLines,
   resolveExecutable,
@@ -40,10 +42,16 @@ export class PiAdapter implements RuntimeAdapter {
   async check(): Promise<{ ok: boolean; version?: string; detail?: string }> {
     try {
       const bin = resolveExecutable(this.bin) ?? this.bin;
-      const { stdout } = await execFileAsync(bin, ['--version'], { timeout: 10_000, env: cliEnv(bin) });
+      const { stdout } = await execFileAsync(bin, ['--version'], {
+        timeout: 10_000,
+        env: cliEnv(bin),
+        // Windows 下 npm 装出来的 claude / codex 是 .cmd，execFile 必须经 shell
+        shell: needsShell(bin),
+        windowsHide: true,
+      });
       return { ok: true, version: stdout.trim().split('\n')[0] };
     } catch (error) {
-      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+      return { ok: false, detail: describeCheckFailure(this.bin, error, 'STAFF_AGENT_PI_BIN') };
     }
   }
 

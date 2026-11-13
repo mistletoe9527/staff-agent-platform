@@ -180,6 +180,60 @@ DELETE FROM agents WHERE is_primary = 0;
 DROP INDEX IF EXISTS idx_agents_device;
 `,
   },
+  {
+    version: 6,
+    name: 'skill-marketplace',
+    // 员工技能广场：skills 是聚合根，skill_versions 保存每次上传的包，
+    // skill_downloads 只用于审计与去重统计（下载量同时冗余在 skills/download_count）。
+    sql: `
+CREATE TABLE skills (
+  id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '通用',
+  tags TEXT NOT NULL DEFAULT '[]',
+  owner_open_id TEXT NOT NULL,
+  owner_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  download_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_skills_owner ON skills (owner_open_id);
+CREATE INDEX idx_skills_status_updated ON skills (status, updated_at);
+CREATE INDEX idx_skills_category ON skills (category);
+
+CREATE TABLE skill_versions (
+  id TEXT PRIMARY KEY,
+  skill_id TEXT NOT NULL REFERENCES skills (id) ON DELETE CASCADE,
+  version TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  readme TEXT NOT NULL DEFAULT '',
+  changelog TEXT NOT NULL DEFAULT '',
+  files_json TEXT NOT NULL DEFAULT '[]',
+  created_by_open_id TEXT NOT NULL,
+  download_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_skill_versions_key ON skill_versions (skill_id, version);
+CREATE INDEX idx_skill_versions_skill ON skill_versions (skill_id, created_at);
+
+CREATE TABLE skill_downloads (
+  id TEXT PRIMARY KEY,
+  skill_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  viewer_key TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_skill_downloads_skill ON skill_downloads (skill_id, created_at);
+CREATE INDEX idx_skill_downloads_version ON skill_downloads (version_id, created_at);
+`,
+  },
 ];
 
 /**

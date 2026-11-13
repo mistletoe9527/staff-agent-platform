@@ -10,9 +10,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@staff-agent/shared": "workspace:*",
+    "fflate": "^0.8.3",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "@staff-agent/shared": "workspace:*"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.2",

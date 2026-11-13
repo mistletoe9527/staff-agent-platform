@@ -8,11 +8,11 @@ interface CachedToken {
 }
 
 /**
- * 飞书网页授权（扫码绑定）。
+ * 飞书网页授权：扫码绑定 + 员工登录 Skill 广场。
  *
- * 只有配置了 PUBLIC_BASE_URL 与 FEISHU_OAUTH_REDIRECT_URI 才启用：
- * 手机扫二维码 → 飞书内打开授权页 → 回调平台拿 open_id → 完成绑定。
- * 内网私有化部署且手机不可达时，自动退化为「页面展示绑定码」。
+ * 绑定需要 PUBLIC_BASE_URL 与 FEISHU_OAUTH_REDIRECT_URI；
+ * 员工登录只需要飞书应用凭证 + FEISHU_WEB_REDIRECT_URI（或由 PUBLIC_BASE_URL 派生）。
+ * 内网私有化部署且手机不可达时，绑定流程自动退化为「页面展示绑定码」。
  */
 export class FeishuOAuth {
   private cached: CachedToken | null = null;
@@ -27,12 +27,12 @@ export class FeishuOAuth {
     return this.config.oauthReady;
   }
 
-  /** 构造授权跳转地址。state 携带绑定码，回调时据此找到设备。 */
-  authorizeUrl(code: string): string {
-    const redirect = encodeURIComponent(this.config.FEISHU_OAUTH_REDIRECT_URI as string);
+  /** 构造授权跳转地址。state 由调用方决定（绑定码或登录回跳地址的签名）。 */
+  authorizeUrl(state: string, redirectUri?: string): string {
+    const redirect = encodeURIComponent(redirectUri ?? (this.config.FEISHU_OAUTH_REDIRECT_URI as string));
     const appId = encodeURIComponent(this.config.FEISHU_APP_ID as string);
-    const state = encodeURIComponent(code);
-    return `${this.config.FEISHU_OPEN_BASE}/open-apis/authen/v1/authorize?app_id=${appId}&redirect_uri=${redirect}&state=${state}`;
+    const encodedState = encodeURIComponent(state);
+    return `${this.config.FEISHU_OPEN_BASE}/open-apis/authen/v1/authorize?app_id=${appId}&redirect_uri=${redirect}&state=${encodedState}`;
   }
 
   /**
@@ -40,7 +40,9 @@ export class FeishuOAuth {
    * @returns 失败返回 null，调用方展示可读错误页
    */
   async exchange(code: string): Promise<{ openId: string; name: string | null } | null> {
-    if (!this.enabled()) return null;
+    // 绑定回调与员工登录共用同一个换码逻辑：只要飞书应用凭证可用即可，
+    // 不要求配置绑定专用的 FEISHU_OAUTH_REDIRECT_URI。
+    if (!this.config.feishuReady) return null;
     try {
       const appToken = await this.getAppAccessToken();
       const tokenResponse = await fetch(`${this.config.FEISHU_OPEN_BASE}/open-apis/authen/v1/oidc/access_token`, {
