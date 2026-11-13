@@ -444,6 +444,11 @@ Troubleshooting order:
    (background daemons started by launchd get a minimal PATH; the gateway additionally searches
    `~/.pi/agent/bin`, `~/.local/bin`, `/opt/homebrew/bin`, …), or the configured working directory
    does not exist (the gateway auto-creates it with `mkdir -p`; the task only fails if that fails).
+7. Windows: `sa doctor` reporting `spawn pi/claude/codex ENOENT` means either the CLI is missing
+   (`where codex` in cmd.exe) or the daemon was started before the CLI was installed — `sa start`
+   inherits the PATH of that moment, so run `sa stop && sa start` after installing. npm global
+   installs land in `%APPDATA%\npm`, which the gateway searches by default; otherwise point
+   `STAFF_AGENT_CODEX_BIN` (or the pi/claude equivalent) at the absolute `.exe` / `.cmd` path.
 
 ## Repository layout
 

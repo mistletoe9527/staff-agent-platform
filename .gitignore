@@ -10,3 +10,4 @@ logs/
 coverage/
 apps/web/dist/
 .pack/
+.idea/

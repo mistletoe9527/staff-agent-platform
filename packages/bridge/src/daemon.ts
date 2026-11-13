@@ -40,6 +40,8 @@ export function startDaemon(): number {
   const child = spawn(process.execPath, [entry, 'start', '--foreground'], {
     detached: true,
     stdio: ['ignore', out, out],
+    // Windows 下不加这个会弹出一个黑框控制台窗口
+    windowsHide: true,
     // 标记一下：子进程退出时自己清 PID 文件，否则 401 退出会留下陈 PID
     env: { ...process.env, STAFF_AGENT_DAEMON: '1' },
   });

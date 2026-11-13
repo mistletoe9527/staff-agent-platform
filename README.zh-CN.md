@@ -388,6 +388,7 @@ docker compose exec platform pnpm --filter @staff-agent/platform migrate
 4. 看 `~/.staff-agent/logs/bridge.log` 与平台 `docker logs`；
 5. 任务卡住看 `runs.lease_expires_at`：租约过期会自动回到队列。
 6. 任务直接失败且报 `spawn xxx ENOENT`：要么运行时 CLI 不在 PATH（后台进程常由 launchd 拉起，PATH 很精简，网关会额外搜索 `~/.pi/agent/bin`、`~/.local/bin`、`/opt/homebrew/bin` 等目录），要么配置里的任务工作目录不存在（网关会按 `mkdir -p` 自动补建，补建失败才会失败任务）。
+7. Windows 上 `sa doctor` 报 `spawn pi/claude/codex ENOENT`：先确认 `where codex` 能查到（Git Bash 里 `which` 只对 bash 生效），再确认 `sa` 是在**安装完 CLI 之后**启动的——`sa start` 的守护进程会继承启动那一刻的 PATH，装完 CLI 要 `sa stop && sa start`。npm 全局安装会把 CLI 放在 `%APPDATA%\npm`（即 `C:\Users\<你>\AppData\Roaming\npm`），网关会自动兜底搜这个目录；如果 CLI 装在别处，用 `STAFF_AGENT_CODEX_BIN` 这类环境变量指向绝对路径（必须是 `.exe` 或 `.cmd`）。
 
 ## 目录结构
 
