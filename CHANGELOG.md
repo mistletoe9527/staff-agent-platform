@@ -5,6 +5,15 @@
 
 ## Unreleased
 
+**网关：Windows 可执行文件解析**
+
+- 修复 Windows 上 `sa doctor` / 任务启动报 `spawn pi|claude|codex ENOENT`：npm 全局安装会同时装
+  `codex`（Git Bash 的 sh 脚本）、`codex.cmd`、`codex.ps1`，原来按原名优先挑到了 sh 脚本，
+  CreateProcess 起不来；现在先按 PATHEXT 找 `.exe/.cmd/.bat`，无扩展名文件必须是真 PE 才认。
+- `.cmd` / `.bat` 改经 `cmd.exe` 启动（`shell: true`），`--version` 探测同样走 shell。
+- 终止子进程改用 `taskkill /T /F` 收整棵进程树，避免 cmd shim 下面的 node 子进程残留。
+- 兜底搜索目录补上 `%APPDATA%\npm`、`%LOCALAPPDATA%\pnpm`、WinGet Links 等 Windows 路径。
+
 **Skill 广场**
 
 - 后台新增「Skill 广场」：员工用飞书网页授权登录后上传 / 下载可复用 Skill；管理员口令登录可管理全部 Skill。

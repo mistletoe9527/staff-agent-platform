@@ -1,5 +1,5 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join } from 'node:path';
 
@@ -60,7 +60,7 @@ const spawnFailures = new WeakMap<ChildProcess, Error>();
  * 后台进程常由 launchd / GUI 拉起，PATH 往往只有 /usr/bin:/bin，
  * 找不到 npm / pip 装到用户目录的 pi、claude、codex。
  */
-const FALLBACK_BIN_DIRS = [
+const POSIX_BIN_DIRS = [
   join(homedir(), '.pi/agent/bin'),
   join(homedir(), '.local/bin'),
   join(homedir(), '.claude/local'),
@@ -73,13 +73,43 @@ const FALLBACK_BIN_DIRS = [
   '/usr/local/bin',
 ];
 
+/**
+ * Windows 的 CLI 落在 npm / pnpm 全局目录或用户目录里，
+ * 目录结构与 POSIX 完全不同，兜底目录必须单独给。
+ */
+function windowsBinDirs(): string[] {
+  const home = homedir();
+  const roaming = process.env.APPDATA ?? join(home, 'AppData/Roaming');
+  const local = process.env.LOCALAPPDATA ?? join(home, 'AppData/Local');
+  return [
+    join(home, '.pi/agent/bin'),
+    join(home, '.claude/local'),
+    join(home, '.bun/bin'),
+    join(home, '.cargo/bin'),
+    join(roaming, 'npm'),
+    join(local, 'pnpm'),
+    join(local, 'Programs/pi/bin'),
+    join(local, 'Microsoft/WinGet/Links'),
+    join(process.env.ProgramData ?? 'C:/ProgramData', 'chocolatey/bin'),
+  ];
+}
+
+/** PATH 里可能有带引号的目录（Windows 常见），去掉引号再查。 */
+function pathDirs(pathValue: string | undefined): string[] {
+  return (pathValue ?? '')
+    .split(delimiter)
+    .map((dir) => dir.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+}
+
 /** 在 PATH 与常见安装目录里查找可执行文件，找不到返回 null。 */
 export function resolveExecutable(command: string): string | null {
   if (!command) return null;
   if (isAbsolute(command) || command.includes('/') || command.includes('\\')) {
     return isExecutableFile(command) ? command : null;
   }
-  const dirs = [...(process.env.PATH ?? '').split(delimiter), ...FALLBACK_BIN_DIRS];
+  const fallback = process.platform === 'win32' ? windowsBinDirs() : POSIX_BIN_DIRS;
+  const dirs = [...pathDirs(process.env.PATH), ...fallback];
   for (const dir of dirs) {
     if (!dir) continue;
     for (const name of candidateNames(command)) {
@@ -90,22 +120,64 @@ export function resolveExecutable(command: string): string | null {
   return null;
 }
 
-/** Windows 下可执行文件带扩展名，其余平台按原名。 */
+/** Windows 上 CreateProcess 能直接启动的扩展名。 */
+const WINDOWS_SPAWNABLE_EXTS = ['.com', '.exe', '.bat', '.cmd'];
+
+/**
+ * Windows 下候选文件名。
+ *
+ * npm / pnpm 在 Windows 上会装三份 shim：`codex`（git-bash 的 sh 脚本）、
+ * `codex.cmd`、`codex.ps1`。按原名优先会挑到 sh 脚本，CreateProcess 起不来（ENOENT），
+ * 所以必须先按 PATHEXT 找 .exe / .cmd / .bat，最后才退回无扩展名文件。
+ */
 function candidateNames(command: string): string[] {
   if (process.platform !== 'win32') return [command];
-  const exts = (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';').filter(Boolean);
-  return [command, ...exts.map((ext) => `${command}${ext.toLowerCase()}`)];
+  if (WINDOWS_SPAWNABLE_EXTS.some((ext) => command.toLowerCase().endsWith(ext))) return [command];
+  const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+    .split(';')
+    .map((ext) => ext.trim().toLowerCase())
+    .filter((ext) => WINDOWS_SPAWNABLE_EXTS.includes(ext));
+  const names = [...new Set(exts)].map((ext) => `${command}${ext}`);
+  return [...names, command];
 }
 
-/** 是否为可执行文件（POSIX 校验执行位，Windows 只校验存在）。 */
+/**
+ * 是否为可执行文件。
+ *
+ * POSIX 校验执行位；Windows 上 .exe / .com 与 .cmd / .bat 可执行，
+ * 无扩展名文件必须是真正的 PE 二进制（否则就是 git-bash 的 sh shim，spawn 会 ENOENT）。
+ */
 function isExecutableFile(path: string): boolean {
   try {
     const stat = statSync(path);
     if (!stat.isFile()) return false;
-    return process.platform === 'win32' ? true : (stat.mode & 0o111) !== 0;
+    if (process.platform !== 'win32') return (stat.mode & 0o111) !== 0;
+    const lower = path.toLowerCase();
+    if (WINDOWS_SPAWNABLE_EXTS.some((ext) => lower.endsWith(ext))) return true;
+    return isPeBinary(path);
   } catch {
     return false;
   }
+}
+
+/** 读文件头判断是否为 PE 可执行文件（"MZ"）。 */
+function isPeBinary(path: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, 'r');
+    const head = Buffer.alloc(2);
+    const read = readSync(fd, head, 0, 2, 0);
+    return read === 2 && head[0] === 0x4d && head[1] === 0x5a;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/** .cmd / .bat 不能直接 CreateProcess，必须经 cmd.exe 拉起。 */
+export function needsShell(bin: string): boolean {
+  return process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin);
 }
 
 /**
@@ -161,6 +233,9 @@ export function spawnCli(
     cwd: options.cwd,
     env: options.env ?? cliEnv(bin),
     stdio: ['pipe', 'pipe', 'pipe'],
+    // Windows 的 npm shim 是 .cmd，只能经 cmd.exe 启动
+    shell: needsShell(bin),
+    windowsHide: true,
   });
   child.on('error', (error: Error) => {
     if (!spawnFailures.has(child)) spawnFailures.set(child, error);
@@ -175,6 +250,25 @@ export function spawnCli(
 /** 子进程是否启动失败。 */
 export function spawnFailure(child: ChildProcess): Error | null {
   return spawnFailures.get(child) ?? null;
+}
+
+/**
+ * 把 `--version` 探测失败翻译成可读提示。
+ *
+ * doctor 直接把 detail 打给员工看，所以这里顺带告诉对方该设哪个环境变量。
+ */
+export function describeCheckFailure(command: string, error: unknown, envVar?: string): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (code === 'ENOENT' || code === 'EINVAL') {
+    if (process.platform === 'win32' && code === 'EINVAL') {
+      return `无法直接启动 ${command}（${message}），它可能是 .cmd/.bat 包装脚本，请升级 sa 到最新版本`;
+    }
+    return envVar
+      ? `本机未找到可执行文件 ${command}，请安装后重试，或用环境变量 ${envVar} 指定其绝对路径（Windows 下要指向 .exe 或 .cmd）`
+      : `本机未找到可执行文件 ${command}，请安装后重试`;
+  }
+  return message;
 }
 
 /** 把启动失败翻译成可读原因；进程正常启动返回 null。 */
@@ -233,10 +327,28 @@ export function writeStdin(child: ChildProcess, content: string): void {
   child.stdin.end();
 }
 
+/**
+ * Windows 没有 SIGTERM，child.kill 只终结直接子进程。
+ * 走 cmd.exe 拉起的 .cmd shim 下面还挂着 node 子进程，必须用 taskkill /T 收整棵树。
+ */
+function killTreeWindows(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) {
+    child.kill();
+    return;
+  }
+  const result = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+  if (result.error) child.kill();
+}
+
 /** 终止子进程：先 SIGTERM，3 秒后 SIGKILL。 */
 export function killProcess(child: ChildProcess): void {
   if (spawnFailures.has(child)) return;
   if (child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32') {
+    killTreeWindows(child);
+    return;
+  }
   child.kill('SIGTERM');
   const timer = setTimeout(() => {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
